@@ -457,9 +457,123 @@ fn extractJsonObject(input: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Attempt to repair common JSON issues from LLM output.
+/// Handles: trailing commas, unbalanced braces/brackets, unbalanced quotes.
+pub fn repairJson(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    // Step 1: Copy input, fixing trailing commas and control chars in strings
+    var in_string = false;
+    var escaped = false;
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        const c = input[i];
+        if (escaped) {
+            try buf.append(allocator, c);
+            escaped = false;
+            continue;
+        }
+        if (in_string) {
+            if (c == '\\') {
+                escaped = true;
+                try buf.append(allocator, c);
+            } else if (c == '"') {
+                in_string = false;
+                try buf.append(allocator, c);
+            } else if (c == '\n') {
+                try buf.appendSlice(allocator, "\\n");
+            } else if (c == '\r') {
+                try buf.appendSlice(allocator, "\\r");
+            } else if (c == '\t') {
+                try buf.appendSlice(allocator, "\\t");
+            } else {
+                try buf.append(allocator, c);
+            }
+        } else {
+            if (c == '"') {
+                in_string = true;
+                try buf.append(allocator, c);
+            } else if (c == ',') {
+                // Check if next non-whitespace is } or ] (trailing comma)
+                var j = i + 1;
+                while (j < input.len and (input[j] == ' ' or input[j] == '\n' or input[j] == '\r' or input[j] == '\t')) j += 1;
+                if (j < input.len and (input[j] == '}' or input[j] == ']')) {
+                    // Skip trailing comma
+                } else {
+                    try buf.append(allocator, c);
+                }
+            } else {
+                try buf.append(allocator, c);
+            }
+        }
+    }
+
+    // Step 2: Balance quotes (if odd number of unescaped quotes, add closing quote)
+    var quote_count: usize = 0;
+    var esc2 = false;
+    for (buf.items) |c| {
+        if (esc2) {
+            esc2 = false;
+            continue;
+        }
+        if (c == '\\') {
+            esc2 = true;
+            continue;
+        }
+        if (c == '"') quote_count += 1;
+    }
+    if (quote_count % 2 != 0) {
+        try buf.append(allocator, '"');
+    }
+
+    // Step 3: Balance braces and brackets
+    var brace_depth: i32 = 0;
+    var bracket_depth: i32 = 0;
+    var in_str = false;
+    var esc3 = false;
+    for (buf.items) |c| {
+        if (esc3) {
+            esc3 = false;
+            continue;
+        }
+        if (c == '\\' and in_str) {
+            esc3 = true;
+            continue;
+        }
+        if (c == '"') in_str = !in_str;
+        if (!in_str) {
+            if (c == '{') brace_depth += 1;
+            if (c == '}') brace_depth -= 1;
+            if (c == '[') bracket_depth += 1;
+            if (c == ']') bracket_depth -= 1;
+        }
+    }
+    while (bracket_depth > 0) : (bracket_depth -= 1) {
+        try buf.append(allocator, ']');
+    }
+    while (brace_depth > 0) : (brace_depth -= 1) {
+        try buf.append(allocator, '}');
+    }
+
+    return try buf.toOwnedSlice(allocator);
+}
+
 /// Parse a JSON tool call object: {"name": "...", "arguments": {...}}
+/// Tries to parse as-is first, then applies JSON repair as fallback.
 fn parseToolCallJson(allocator: std.mem.Allocator, json_str: []const u8) !ParsedToolCall {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_str, .{});
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch {
+        // JSON parse failed — try repair
+        const repaired = repairJson(allocator, json_str) catch return error.InvalidToolCallFormat;
+        defer allocator.free(repaired);
+        const reparsed = std.json.parseFromSlice(std.json.Value, allocator, repaired, .{}) catch
+            return error.InvalidToolCallFormat;
+        return parseToolCallJsonInner(allocator, reparsed);
+    };
+    return parseToolCallJsonInner(allocator, parsed);
+}
+
+fn parseToolCallJsonInner(allocator: std.mem.Allocator, parsed: std.json.Parsed(std.json.Value)) !ParsedToolCall {
     defer parsed.deinit();
 
     const obj = switch (parsed.value) {
@@ -1332,4 +1446,98 @@ test "extractJsonObject prefers earlier brace over bracket" {
     const input = "{\"arr\": [1, 2]}";
     const result = extractJsonObject(input).?;
     try std.testing.expectEqualStrings("{\"arr\": [1, 2]}", result);
+}
+
+// ── JSON Repair Tests ───────────────────────────────────────────
+
+test "repairJson removes trailing commas" {
+    const allocator = std.testing.allocator;
+    const result = try repairJson(allocator, "{\"key\": \"value\",}");
+    defer allocator.free(result);
+    // Should be valid JSON after repair
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("value", parsed.value.object.get("key").?.string);
+}
+
+test "repairJson removes trailing comma in array" {
+    const allocator = std.testing.allocator;
+    const result = try repairJson(allocator, "[1, 2, 3,]");
+    defer allocator.free(result);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.array.items.len);
+}
+
+test "repairJson balances unclosed braces" {
+    const allocator = std.testing.allocator;
+    const result = try repairJson(allocator, "{\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"");
+    defer allocator.free(result);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("shell", parsed.value.object.get("name").?.string);
+}
+
+test "repairJson balances unclosed brackets" {
+    const allocator = std.testing.allocator;
+    const result = try repairJson(allocator, "[1, 2, 3");
+    defer allocator.free(result);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.array.items.len);
+}
+
+test "repairJson balances unclosed quote" {
+    const allocator = std.testing.allocator;
+    const result = try repairJson(allocator, "{\"name\": \"shell}");
+    defer allocator.free(result);
+    // After repair, should have balanced quotes and closing brace
+    try std.testing.expect(std.mem.indexOf(u8, result, "shell") != null);
+}
+
+test "repairJson escapes newlines in strings" {
+    const allocator = std.testing.allocator;
+    const result = try repairJson(allocator, "{\"content\": \"line1\nline2\"}");
+    defer allocator.free(result);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("line1\nline2", parsed.value.object.get("content").?.string);
+}
+
+test "repairJson passes through valid JSON unchanged" {
+    const allocator = std.testing.allocator;
+    const valid = "{\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}";
+    const result = try repairJson(allocator, valid);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(valid, result);
+}
+
+test "repairJson handles combined issues" {
+    const allocator = std.testing.allocator;
+    // Trailing comma + unclosed brace
+    const result = try repairJson(allocator, "{\"name\": \"test\", \"args\": {\"a\": 1,}");
+    defer allocator.free(result);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("test", parsed.value.object.get("name").?.string);
+}
+
+test "parseToolCallJson with trailing comma repair" {
+    const allocator = std.testing.allocator;
+    const result = try parseToolCallJson(allocator, "{\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"},}");
+    defer {
+        allocator.free(result.name);
+        allocator.free(result.arguments_json);
+    }
+    try std.testing.expectEqualStrings("shell", result.name);
+}
+
+test "parseToolCallJson with unclosed brace repair" {
+    const allocator = std.testing.allocator;
+    const result = try parseToolCallJson(allocator, "{\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}");
+    defer {
+        allocator.free(result.name);
+        allocator.free(result.arguments_json);
+    }
+    try std.testing.expectEqualStrings("shell", result.name);
 }

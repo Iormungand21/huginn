@@ -245,9 +245,63 @@ pub const Agent = struct {
         return true;
     }
 
+    /// Handle slash commands that don't require LLM.
+    /// Returns an owned response string, or null if not a slash command.
+    pub fn handleSlashCommand(self: *Agent, message: []const u8) !?[]const u8 {
+        const trimmed = std.mem.trim(u8, message, " \t\r\n");
+
+        if (std.mem.eql(u8, trimmed, "/new")) {
+            self.clearHistory();
+            return try self.allocator.dupe(u8, "Session cleared.");
+        }
+
+        if (std.mem.eql(u8, trimmed, "/help")) {
+            return try self.allocator.dupe(u8,
+                \\Available commands:
+                \\  /new     — Clear conversation history and start fresh
+                \\  /help    — Show this help message
+                \\  /status  — Show current model, provider and session stats
+                \\  /model <name> — Switch to a different model
+                \\  exit, quit — Exit interactive mode
+            );
+        }
+
+        if (std.mem.eql(u8, trimmed, "/status")) {
+            return try std.fmt.allocPrint(
+                self.allocator,
+                "Model: {s}\nHistory: {d} messages\nTokens used: {d}\nTools: {d} available",
+                .{
+                    self.model_name,
+                    self.history.items.len,
+                    self.total_tokens,
+                    self.tools.len,
+                },
+            );
+        }
+
+        if (std.mem.eql(u8, trimmed, "/model") or std.mem.startsWith(u8, trimmed, "/model ")) {
+            const arg = if (trimmed.len > "/model".len)
+                std.mem.trim(u8, trimmed["/model".len..], " \t")
+            else
+                "";
+            if (arg.len == 0) {
+                return try std.fmt.allocPrint(self.allocator, "Current model: {s}", .{self.model_name});
+            }
+            self.model_name = arg;
+            return try std.fmt.allocPrint(self.allocator, "Switched to model: {s}", .{arg});
+        }
+
+        return null;
+    }
+
     /// Execute a single conversation turn: send messages to LLM, parse tool calls,
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
+        // Handle slash commands before sending to LLM (saves tokens)
+        if (try self.handleSlashCommand(user_message)) |response| {
+            return response;
+        }
+
         // Inject system prompt on first turn
         if (!self.has_system_prompt) {
             const system_prompt = try prompt.buildSystemPrompt(self.allocator, .{
@@ -496,11 +550,19 @@ pub const Agent = struct {
                 try results_buf.append(self.allocator, result);
             }
 
-            // Format tool results and add to history
+            // Format tool results, scrub credentials, add reflection prompt, and add to history
             const formatted_results = try dispatcher.formatToolResults(self.allocator, results_buf.items);
+            defer self.allocator.free(formatted_results);
+            const scrubbed_results = try providers.scrubToolOutput(self.allocator, formatted_results);
+            defer self.allocator.free(scrubbed_results);
+            const with_reflection = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}\n\nReflect on the tool results above and decide your next steps.",
+                .{scrubbed_results},
+            );
             try self.history.append(self.allocator, .{
                 .role = .user,
-                .content = formatted_results,
+                .content = with_reflection,
             });
 
             self.trimHistory();
@@ -717,7 +779,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         const line = line_buf[0..pos];
 
         if (line.len == 0) continue;
-        if (std.mem.eql(u8, line, "exit") or std.mem.eql(u8, line, "quit")) return;
+        if (std.mem.eql(u8, line, "exit") or std.mem.eql(u8, line, "quit") or
+            std.mem.eql(u8, line, ":q") or std.mem.eql(u8, line, "/exit")) return;
 
         // Use legacy provider path for REPL
         const response = providers.complete(allocator, &cfg, line) catch |err| {
@@ -1374,4 +1437,121 @@ test "parseStructuredToolCalls empty id yields null tool_call_id" {
 
     try std.testing.expectEqual(@as(usize, 1), result.len);
     try std.testing.expect(result[0].tool_call_id == null);
+}
+
+// ── Slash Command Tests ──────────────────────────────────────────
+
+fn makeTestAgent(allocator: std.mem.Allocator) !Agent {
+    var noop = observability.NoopObserver{};
+    return Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+}
+
+test "slash /new clears history" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    // Add some history
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "sys"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "hello"),
+    });
+    agent.has_system_prompt = true;
+
+    const response = (try agent.handleSlashCommand("/new")).?;
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("Session cleared.", response);
+    try std.testing.expectEqual(@as(usize, 0), agent.historyLen());
+    try std.testing.expect(!agent.has_system_prompt);
+}
+
+test "slash /help returns help text" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    const response = (try agent.handleSlashCommand("/help")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "/new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/help") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/status") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model") != null);
+}
+
+test "slash /status returns agent info" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.total_tokens = 42;
+    const response = (try agent.handleSlashCommand("/status")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "test-model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "42") != null);
+}
+
+test "slash /model switches model" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    const response = (try agent.handleSlashCommand("/model gpt-4o")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "gpt-4o") != null);
+    try std.testing.expectEqualStrings("gpt-4o", agent.model_name);
+}
+
+test "slash /model without name shows current" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    const response = (try agent.handleSlashCommand("/model ")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "test-model") != null);
+}
+
+test "non-slash message returns null" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    const response = try agent.handleSlashCommand("hello world");
+    try std.testing.expect(response == null);
+}
+
+test "slash command with whitespace" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    const response = (try agent.handleSlashCommand("  /help  ")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "/new") != null);
 }

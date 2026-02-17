@@ -31,8 +31,11 @@ pub const cron_remove = @import("cron_remove.zig");
 pub const cron_runs = @import("cron_runs.zig");
 pub const cron_run = @import("cron_run.zig");
 pub const cron_update = @import("cron_update.zig");
+pub const message = @import("message.zig");
 pub const pushover = @import("pushover.zig");
 pub const schema = @import("schema.zig");
+pub const web_search = @import("web_search.zig");
+pub const web_fetch = @import("web_fetch.zig");
 
 // ── Core types ──────────────────────────────────────────────────────
 

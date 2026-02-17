@@ -6,8 +6,10 @@
 //!   onboard, providers, security, skills, tools
 
 // Phase 1: Core
+pub const bus = @import("bus.zig");
 pub const config = @import("config.zig");
 pub const util = @import("util.zig");
+pub const state = @import("state.zig");
 pub const status = @import("status.zig");
 pub const onboard = @import("onboard.zig");
 pub const doctor = @import("doctor.zig");
@@ -17,6 +19,7 @@ pub const migration = @import("migration.zig");
 
 // Phase 2: Agent core
 pub const agent = @import("agent.zig");
+pub const session = @import("session.zig");
 pub const providers = @import("providers/root.zig");
 pub const memory = @import("memory/root.zig");
 

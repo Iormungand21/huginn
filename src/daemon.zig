@@ -11,6 +11,8 @@ const health = @import("health.zig");
 const Config = @import("config.zig").Config;
 const CronScheduler = @import("cron.zig").CronScheduler;
 const cron = @import("cron.zig");
+const bus_mod = @import("bus.zig");
+const dispatch = @import("channels/dispatch.zig");
 
 /// How often the daemon state file is flushed (seconds).
 const STATUS_FLUSH_SECONDS: u64 = 5;
@@ -297,6 +299,26 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config) !void {
         }
     }
 
+    // Event bus + outbound dispatcher
+    var event_bus = bus_mod.Bus.init();
+    var channel_registry = dispatch.ChannelRegistry.init(allocator);
+    defer channel_registry.deinit();
+    var dispatch_stats = dispatch.DispatchStats{};
+
+    state.addComponent("outbound_dispatcher");
+
+    var dispatcher_thread: ?std.Thread = null;
+    if (std.Thread.spawn(.{}, dispatch.runOutboundDispatcher, .{
+        allocator, &event_bus, &channel_registry, &dispatch_stats,
+    })) |thread| {
+        dispatcher_thread = thread;
+        state.markRunning("outbound_dispatcher");
+        health.markComponentOk("outbound_dispatcher");
+    } else |err| {
+        state.markError("outbound_dispatcher", @errorName(err));
+        stdout.print("Warning: outbound dispatcher thread failed: {}\n", .{err}) catch {};
+    }
+
     // Main thread: wait for shutdown signal (poll-based)
     while (!isShutdownRequested()) {
         std.Thread.sleep(1 * std.time.ns_per_s);
@@ -304,11 +326,15 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config) !void {
 
     try stdout.print("\nShutting down...\n", .{});
 
+    // Close bus to signal dispatcher to exit
+    event_bus.close();
+
     // Write final state
     state.markError("gateway", "shutting down");
     writeStateFile(allocator, state_path, &state) catch {};
 
     // Wait for threads
+    if (dispatcher_thread) |t| t.join();
     if (chan_thread) |t| t.join();
     if (sched_thread) |t| t.join();
     if (hb_thread) |t| t.join();

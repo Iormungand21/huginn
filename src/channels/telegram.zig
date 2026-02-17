@@ -285,32 +285,40 @@ pub const TelegramChannel = struct {
         self.allocator.free(resp);
     }
 
-    // ── Markdown fallback ───────────────────────────────────────────
+    // ── HTML fallback ────────────────────────────────────────────────
 
-    /// Send text with Markdown parse_mode; on failure, retry as plain text.
+    /// Send text with HTML parse_mode (converted from Markdown); on failure, retry as plain text.
     fn sendWithMarkdownFallback(self: *TelegramChannel, chat_id: []const u8, text: []const u8) !void {
         var url_buf: [512]u8 = undefined;
         const url = try self.apiUrl(&url_buf, "sendMessage");
 
-        // Build Markdown body
-        var md_body: std.ArrayListUnmanaged(u8) = .empty;
-        defer md_body.deinit(self.allocator);
+        // Convert Markdown → Telegram HTML
+        const html_text = markdownToTelegramHtml(self.allocator, text) catch {
+            // Conversion failed — send as plain text
+            try self.sendChunkPlain(chat_id, text);
+            return;
+        };
+        defer self.allocator.free(html_text);
 
-        try md_body.appendSlice(self.allocator, "{\"chat_id\":");
-        try md_body.appendSlice(self.allocator, chat_id);
-        try md_body.appendSlice(self.allocator, ",\"text\":\"");
-        try appendJsonEscaped(&md_body, self.allocator, text);
-        try md_body.appendSlice(self.allocator, "\",\"parse_mode\":\"Markdown\"}");
+        // Build HTML body
+        var html_body: std.ArrayListUnmanaged(u8) = .empty;
+        defer html_body.deinit(self.allocator);
 
-        const md_resp = curlPost(self.allocator, url, md_body.items, null) catch {
+        try html_body.appendSlice(self.allocator, "{\"chat_id\":");
+        try html_body.appendSlice(self.allocator, chat_id);
+        try html_body.appendSlice(self.allocator, ",\"text\":\"");
+        try appendJsonEscaped(&html_body, self.allocator, html_text);
+        try html_body.appendSlice(self.allocator, "\",\"parse_mode\":\"HTML\"}");
+
+        const resp = curlPost(self.allocator, url, html_body.items, null) catch {
             // Network error — fall through to plain send
             try self.sendChunkPlain(chat_id, text);
             return;
         };
 
         // Check if response indicates error (contains "error_code")
-        if (std.mem.indexOf(u8, md_resp, "\"error_code\"") != null) {
-            // Markdown failed, retry as plain text
+        if (std.mem.indexOf(u8, resp, "\"error_code\"") != null) {
+            // HTML failed, retry as plain text
             try self.sendChunkPlain(chat_id, text);
             return;
         }
@@ -633,6 +641,247 @@ fn curlPost(allocator: std.mem.Allocator, url: []const u8, body: []const u8, aut
 
     return stdout;
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Markdown → Telegram HTML Conversion
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Convert Markdown to Telegram-compatible HTML.
+/// Handles: code blocks, inline code, bold, italic, strikethrough,
+/// links, headers, bullet lists. Escapes HTML entities.
+pub fn markdownToTelegramHtml(allocator: std.mem.Allocator, md: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    var i: usize = 0;
+    var line_start = true;
+
+    while (i < md.len) {
+        // ── Code blocks ``` ... ``` ──
+        if (i + 2 < md.len and md[i] == '`' and md[i + 1] == '`' and md[i + 2] == '`') {
+            // Find closing ```
+            const content_start = if (i + 3 < md.len and md[i + 3] == '\n') i + 4 else i + 3;
+            // Skip language tag on same line
+            const lang_end = std.mem.indexOfScalarPos(u8, md, i + 3, '\n') orelse md.len;
+            const actual_start = if (lang_end < md.len) lang_end + 1 else content_start;
+
+            const close = findTripleBacktick(md, actual_start);
+            if (close) |end| {
+                try buf.appendSlice(allocator, "<pre>");
+                try appendHtmlEscaped(&buf, allocator, md[actual_start..end]);
+                try buf.appendSlice(allocator, "</pre>");
+                // Skip past closing ```
+                i = end + 3;
+                if (i < md.len and md[i] == '\n') i += 1;
+                line_start = true;
+                continue;
+            }
+        }
+
+        // ── Inline code `...` ──
+        if (md[i] == '`') {
+            const close = std.mem.indexOfScalarPos(u8, md, i + 1, '`');
+            if (close) |end| {
+                try buf.appendSlice(allocator, "<code>");
+                try appendHtmlEscaped(&buf, allocator, md[i + 1 .. end]);
+                try buf.appendSlice(allocator, "</code>");
+                i = end + 1;
+                line_start = false;
+                continue;
+            }
+        }
+
+        // ── Headers at line start ──
+        if (line_start and md[i] == '#') {
+            var level: usize = 0;
+            while (i + level < md.len and md[i + level] == '#') level += 1;
+            if (level <= 6 and i + level < md.len and md[i + level] == ' ') {
+                i += level + 1; // skip "# "
+                const end = std.mem.indexOfScalarPos(u8, md, i, '\n') orelse md.len;
+                try buf.appendSlice(allocator, "<b>");
+                try appendHtmlEscaped(&buf, allocator, md[i..end]);
+                try buf.appendSlice(allocator, "</b>");
+                i = end;
+                if (i < md.len) {
+                    try buf.append(allocator, '\n');
+                    i += 1;
+                }
+                line_start = true;
+                continue;
+            }
+        }
+
+        // ── Bullet lists at line start ──
+        if (line_start and md[i] == '-' and i + 1 < md.len and md[i + 1] == ' ') {
+            try buf.appendSlice(allocator, "\u{2022} "); // • bullet
+            i += 2;
+            line_start = false;
+            continue;
+        }
+
+        // ── Strikethrough ~~text~~ ──
+        if (i + 1 < md.len and md[i] == '~' and md[i + 1] == '~') {
+            const close = std.mem.indexOf(u8, md[i + 2 ..], "~~");
+            if (close) |offset| {
+                try buf.appendSlice(allocator, "<s>");
+                try appendHtmlEscaped(&buf, allocator, md[i + 2 .. i + 2 + offset]);
+                try buf.appendSlice(allocator, "</s>");
+                i = i + 2 + offset + 2;
+                line_start = false;
+                continue;
+            }
+        }
+
+        // ── Bold **text** ──
+        if (i + 1 < md.len and md[i] == '*' and md[i + 1] == '*') {
+            const close = std.mem.indexOf(u8, md[i + 2 ..], "**");
+            if (close) |offset| {
+                try buf.appendSlice(allocator, "<b>");
+                try appendHtmlEscaped(&buf, allocator, md[i + 2 .. i + 2 + offset]);
+                try buf.appendSlice(allocator, "</b>");
+                i = i + 2 + offset + 2;
+                line_start = false;
+                continue;
+            }
+        }
+
+        // ── Links [text](url) ──
+        if (md[i] == '[') {
+            const close_bracket = std.mem.indexOfScalarPos(u8, md, i + 1, ']');
+            if (close_bracket) |cb| {
+                if (cb + 1 < md.len and md[cb + 1] == '(') {
+                    const close_paren = std.mem.indexOfScalarPos(u8, md, cb + 2, ')');
+                    if (close_paren) |cp| {
+                        const text = md[i + 1 .. cb];
+                        const href = md[cb + 2 .. cp];
+                        try buf.appendSlice(allocator, "<a href=\"");
+                        try appendHtmlEscaped(&buf, allocator, href);
+                        try buf.appendSlice(allocator, "\">");
+                        try appendHtmlEscaped(&buf, allocator, text);
+                        try buf.appendSlice(allocator, "</a>");
+                        i = cp + 1;
+                        line_start = false;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // ── Italic _text_ (not __text__) ──
+        if (md[i] == '_' and !(i + 1 < md.len and md[i + 1] == '_')) {
+            // Don't match inside words (check prev char)
+            const prev_ok = (i == 0 or md[i - 1] == ' ' or md[i - 1] == '\n' or md[i - 1] == '(');
+            if (prev_ok) {
+                const close = std.mem.indexOfScalarPos(u8, md, i + 1, '_');
+                if (close) |end| {
+                    // Check next char after closing _
+                    const next_ok = (end + 1 >= md.len or md[end + 1] == ' ' or md[end + 1] == '\n' or md[end + 1] == ',' or md[end + 1] == '.' or md[end + 1] == ')');
+                    if (next_ok and end > i + 1) {
+                        try buf.appendSlice(allocator, "<i>");
+                        try appendHtmlEscaped(&buf, allocator, md[i + 1 .. end]);
+                        try buf.appendSlice(allocator, "</i>");
+                        i = end + 1;
+                        line_start = false;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // ── Regular character ──
+        if (md[i] == '\n') {
+            try buf.append(allocator, '\n');
+            line_start = true;
+        } else {
+            switch (md[i]) {
+                '&' => try buf.appendSlice(allocator, "&amp;"),
+                '<' => try buf.appendSlice(allocator, "&lt;"),
+                '>' => try buf.appendSlice(allocator, "&gt;"),
+                else => try buf.append(allocator, md[i]),
+            }
+            line_start = false;
+        }
+        i += 1;
+    }
+
+    return buf.toOwnedSlice(allocator);
+}
+
+fn findTripleBacktick(md: []const u8, from: usize) ?usize {
+    var pos = from;
+    while (pos + 2 < md.len) {
+        if (md[pos] == '`' and md[pos + 1] == '`' and md[pos + 2] == '`') return pos;
+        pos += 1;
+    }
+    return null;
+}
+
+/// Escape HTML entities for Telegram HTML parse_mode.
+fn appendHtmlEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+    for (text) |c| {
+        switch (c) {
+            '&' => try buf.appendSlice(allocator, "&amp;"),
+            '<' => try buf.appendSlice(allocator, "&lt;"),
+            '>' => try buf.appendSlice(allocator, "&gt;"),
+            '"' => try buf.appendSlice(allocator, "&quot;"),
+            else => try buf.append(allocator, c),
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Periodic Typing Indicator
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Periodic typing indicator — sends "typing" action every 4 seconds
+/// until stopped. Telegram typing status expires after 5 seconds.
+pub const TypingIndicator = struct {
+    channel: *TelegramChannel,
+    chat_id: [64]u8 = undefined,
+    chat_id_len: usize = 0,
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: ?std.Thread = null,
+
+    /// How often to send the typing indicator (nanoseconds).
+    const INTERVAL_NS: u64 = 4 * std.time.ns_per_s;
+
+    pub fn init(ch: *TelegramChannel) TypingIndicator {
+        return .{ .channel = ch };
+    }
+
+    /// Start the periodic typing indicator for a chat.
+    pub fn start(self: *TypingIndicator, chat_id: []const u8) void {
+        if (self.running.load(.acquire)) return; // already running
+        if (chat_id.len > self.chat_id.len) return;
+
+        @memcpy(self.chat_id[0..chat_id.len], chat_id);
+        self.chat_id_len = chat_id.len;
+        self.running.store(true, .release);
+
+        self.thread = std.Thread.spawn(.{}, typingLoop, .{self}) catch null;
+    }
+
+    /// Stop the periodic typing indicator.
+    pub fn stop(self: *TypingIndicator) void {
+        self.running.store(false, .release);
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+    }
+
+    fn typingLoop(self: *TypingIndicator) void {
+        while (self.running.load(.acquire)) {
+            self.channel.sendTypingIndicator(self.chat_id[0..self.chat_id_len]);
+            // Sleep in small increments to check running flag responsively
+            var elapsed: u64 = 0;
+            while (elapsed < INTERVAL_NS and self.running.load(.acquire)) {
+                std.Thread.sleep(100 * std.time.ns_per_ms);
+                elapsed += 100 * std.time.ns_per_ms;
+            }
+        }
+    }
+};
 
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
@@ -966,4 +1215,122 @@ test "telegram AttachmentKind formField returns correct fields" {
     try std.testing.expectEqualStrings("video", AttachmentKind.video.formField());
     try std.testing.expectEqualStrings("audio", AttachmentKind.audio.formField());
     try std.testing.expectEqualStrings("voice", AttachmentKind.voice.formField());
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Markdown → HTML Conversion Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "telegram markdownToTelegramHtml bold" {
+    const html = try markdownToTelegramHtml(std.testing.allocator, "This is **bold** text");
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings("This is <b>bold</b> text", html);
+}
+
+test "telegram markdownToTelegramHtml italic" {
+    const html = try markdownToTelegramHtml(std.testing.allocator, "This is _italic_ text");
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings("This is <i>italic</i> text", html);
+}
+
+test "telegram markdownToTelegramHtml inline code" {
+    const html = try markdownToTelegramHtml(std.testing.allocator, "Use `code` here");
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings("Use <code>code</code> here", html);
+}
+
+test "telegram markdownToTelegramHtml code block" {
+    const html = try markdownToTelegramHtml(std.testing.allocator, "```\nhello\n```");
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings("<pre>hello\n</pre>", html);
+}
+
+test "telegram markdownToTelegramHtml code block with language" {
+    const html = try markdownToTelegramHtml(std.testing.allocator, "```python\nprint('hi')\n```");
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings("<pre>print('hi')\n</pre>", html);
+}
+
+test "telegram markdownToTelegramHtml strikethrough" {
+    const html = try markdownToTelegramHtml(std.testing.allocator, "This is ~~deleted~~ text");
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings("This is <s>deleted</s> text", html);
+}
+
+test "telegram markdownToTelegramHtml link" {
+    const html = try markdownToTelegramHtml(std.testing.allocator, "Click [here](https://example.com)");
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings("Click <a href=\"https://example.com\">here</a>", html);
+}
+
+test "telegram markdownToTelegramHtml header" {
+    const html = try markdownToTelegramHtml(std.testing.allocator, "# Title\n## Subtitle");
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings("<b>Title</b>\n<b>Subtitle</b>", html);
+}
+
+test "telegram markdownToTelegramHtml bullet list" {
+    const html = try markdownToTelegramHtml(std.testing.allocator, "- Item 1\n- Item 2");
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings("\u{2022} Item 1\n\u{2022} Item 2", html);
+}
+
+test "telegram markdownToTelegramHtml escapes HTML entities" {
+    const html = try markdownToTelegramHtml(std.testing.allocator, "A < B & C > D");
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings("A &lt; B &amp; C &gt; D", html);
+}
+
+test "telegram markdownToTelegramHtml plain text passthrough" {
+    const html = try markdownToTelegramHtml(std.testing.allocator, "Just plain text.");
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings("Just plain text.", html);
+}
+
+test "telegram markdownToTelegramHtml empty" {
+    const html = try markdownToTelegramHtml(std.testing.allocator, "");
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqual(@as(usize, 0), html.len);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Periodic Typing Indicator Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "telegram TypingIndicator init" {
+    var ch = TelegramChannel.init(std.testing.allocator, "tok", &.{});
+    var ti = TypingIndicator.init(&ch);
+    try std.testing.expect(!ti.running.load(.acquire));
+    try std.testing.expect(ti.thread == null);
+}
+
+test "telegram TypingIndicator start and stop" {
+    var ch = TelegramChannel.init(std.testing.allocator, "invalid:token", &.{});
+    var ti = TypingIndicator.init(&ch);
+
+    ti.start("12345");
+    try std.testing.expect(ti.running.load(.acquire));
+
+    // Let it run briefly
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    ti.stop();
+    try std.testing.expect(!ti.running.load(.acquire));
+    try std.testing.expect(ti.thread == null);
+}
+
+test "telegram TypingIndicator double start is safe" {
+    var ch = TelegramChannel.init(std.testing.allocator, "invalid:token", &.{});
+    var ti = TypingIndicator.init(&ch);
+
+    ti.start("123");
+    ti.start("456"); // should not spawn second thread
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+    ti.stop();
+}
+
+test "telegram TypingIndicator stop without start is safe" {
+    var ch = TelegramChannel.init(std.testing.allocator, "tok", &.{});
+    var ti = TypingIndicator.init(&ch);
+    ti.stop(); // no-op
 }
