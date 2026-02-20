@@ -403,11 +403,11 @@ test "getString returns unescaped quotes and backslashes" {
 }
 
 test "getString returns unescaped unicode" {
-    // \u0041 = A, \u041f = П
-    const parsed = try parseTestArgs("{\"s\":\"\\u0041BC \\u041f\\u0440\\u0438\\u0432\\u0435\\u0442\"}");
+    // \u0041 = A, \u00c9 = É
+    const parsed = try parseTestArgs("{\"s\":\"\\u0041BC \\u00c9\\u00f6\\u00fc\\u00e4\\u00e8\"}");
     defer parsed.deinit();
     const val = getString(parsed.value.object, "s").?;
-    try std.testing.expectEqualStrings("ABC Привет", val);
+    try std.testing.expectEqualStrings("ABC Éöüäè", val);
 }
 
 test "getString returns unescaped shell script content" {

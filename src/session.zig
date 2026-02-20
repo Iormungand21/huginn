@@ -161,6 +161,8 @@ pub const SessionManager = struct {
                 if (std.mem.eql(u8, trimmed, "/new")) {
                     // Clear persisted messages on session reset
                     sqlite_mem.clearMessages(session_key) catch {};
+                    // Clear stale auto-saved memories
+                    sqlite_mem.clearAutoSaved() catch {};
                 } else if (!std.mem.startsWith(u8, trimmed, "/")) {
                     // Persist user + assistant messages (skip slash commands)
                     sqlite_mem.saveMessage(session_key, "user", content) catch {};

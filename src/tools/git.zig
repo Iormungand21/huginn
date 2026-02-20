@@ -505,8 +505,8 @@ test "truncateCommitMessage short message unchanged" {
 }
 
 test "truncateCommitMessage truncates at UTF-8 boundary" {
-    // "Привет" in UTF-8 is 12 bytes (2 bytes per Cyrillic char)
-    const msg = "Привет мир!"; // 20 bytes
+    // "Éééééé" in UTF-8 is 12 bytes (2 bytes per accented char)
+    const msg = "Éééééé ààà!"; // 20 bytes
     const truncated = GitTool.truncateCommitMessage(msg, 10);
     // Should truncate to 10 bytes which is at a clean boundary (5 Cyrillic chars)
     try std.testing.expect(truncated.len <= 10);

@@ -107,7 +107,7 @@ pub const SchedulerConfig = struct {
 
 pub const AgentConfig = struct {
     compact_context: bool = false,
-    max_tool_iterations: u32 = 10,
+    max_tool_iterations: u32 = 25,
     max_history_messages: u32 = 50,
     parallel_tools: bool = false,
     tool_dispatcher: []const u8 = "auto",

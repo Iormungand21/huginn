@@ -502,10 +502,10 @@ test "voice parseTranscriptionText valid" {
 
 test "voice parseTranscriptionText unicode" {
     const allocator = std.testing.allocator;
-    const json = "{\"text\":\"Привет мир\"}";
+    const json = "{\"text\":\"Héllo wörld\"}";
     const text = try parseTranscriptionText(allocator, json);
     defer allocator.free(text);
-    try std.testing.expectEqualStrings("Привет мир", text);
+    try std.testing.expectEqualStrings("Héllo wörld", text);
 }
 
 test "voice parseTranscriptionText missing field" {

@@ -866,10 +866,9 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
                 typing.stop();
                 std.debug.print("  Agent error: {}\n", .{err});
                 const err_msg = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Ошибка сети. Попробуй ещё раз.",
-                    error.MaxToolIterationsExceeded => "Превышен лимит итераций инструментов.",
-                    error.OutOfMemory => "Недостаточно памяти для обработки.",
-                    else => "Произошла ошибка. Попробуй ещё раз или /new для новой сессии.",
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
+                    error.OutOfMemory => "Out of memory.",
+                    else => "An error occurred. Try again or /new for a fresh session.",
                 };
                 tg.sendMessageWithReply(msg.sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
                 continue;

@@ -35,7 +35,7 @@ const ToolExecutionResult = dispatcher.ToolExecutionResult;
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Maximum agentic tool-use iterations per user message.
-const DEFAULT_MAX_TOOL_ITERATIONS: u32 = 10;
+const DEFAULT_MAX_TOOL_ITERATIONS: u32 = 25;
 
 /// Maximum non-system messages before trimming.
 const DEFAULT_MAX_HISTORY: u32 = 50;
@@ -373,6 +373,12 @@ pub const Agent = struct {
 
         if (std.mem.eql(u8, trimmed, "/new")) {
             self.clearHistory();
+            // Clear stale auto-saved memories to prevent re-injection
+            if (self.mem) |mem| {
+                if (mem.asSqlite()) |sqlite_mem| {
+                    sqlite_mem.clearAutoSaved() catch {};
+                }
+            }
             return try self.allocator.dupe(u8, "Session cleared.");
         }
 
@@ -715,7 +721,7 @@ pub const Agent = struct {
                 // No tool calls — final response
                 const final_text = if (self.context_was_compacted) blk: {
                     self.context_was_compacted = false;
-                    break :blk try std.fmt.allocPrint(self.allocator, "[Контекст сжат]\n\n{s}", .{display_text});
+                    break :blk try std.fmt.allocPrint(self.allocator, "[Context compacted]\n\n{s}", .{display_text});
                 } else try self.allocator.dupe(u8, display_text);
 
                 // Dupe from display_text directly (not from final_text) to avoid double-dupe
@@ -815,7 +821,69 @@ pub const Agent = struct {
             self.freeResponseFields(&response);
         }
 
-        return error.MaxToolIterationsExceeded;
+        // ── Graceful degradation: tool iterations exhausted ──────────
+        // Instead of returning an error, ask the LLM to summarize what it
+        // has accomplished so far and return that as the final response.
+        const exhausted_event = ObserverEvent{ .tool_iterations_exhausted = .{ .iterations = self.max_tool_iterations } };
+        self.observer.recordEvent(&exhausted_event);
+        log.warn("Tool iterations exhausted ({d}/{d}), requesting summary", .{ self.max_tool_iterations, self.max_tool_iterations });
+
+        // Append a pseudo-user message forcing a text-only summary
+        try self.history.append(self.allocator, .{
+            .role = .user,
+            .content = try self.allocator.dupe(u8, "SYSTEM: You have reached the maximum number of tool iterations. " ++
+                "You MUST NOT call any more tools. Summarize what you have accomplished " ++
+                "so far and what remains to be done. Respond in the same language the user used."),
+        });
+
+        // Build messages for the summary call
+        const summary_messages = self.buildMessageSlice() catch {
+            const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
+            const complete_event = ObserverEvent{ .turn_complete = {} };
+            self.observer.recordEvent(&complete_event);
+            return fallback;
+        };
+        defer self.allocator.free(summary_messages);
+
+        var summary_response = self.provider.chat(
+            self.allocator,
+            .{
+                .messages = summary_messages,
+                .model = self.model_name,
+                .temperature = self.temperature,
+                .max_tokens = self.max_tokens,
+                .tools = null, // force text-only
+                .timeout_secs = self.message_timeout_secs,
+                .reasoning_effort = self.reasoning_effort,
+            },
+            self.model_name,
+            self.temperature,
+        ) catch {
+            const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
+            const complete_event = ObserverEvent{ .turn_complete = {} };
+            self.observer.recordEvent(&complete_event);
+            return fallback;
+        };
+        defer self.freeResponseFields(&summary_response);
+
+        const summary_text = summary_response.contentOrEmpty();
+        const prefixed = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}]\n\n{s}", .{ self.max_tool_iterations, self.max_tool_iterations, summary_text });
+        errdefer self.allocator.free(prefixed);
+
+        // Store in history (dupe the raw summary, not the prefixed version)
+        try self.history.append(self.allocator, .{
+            .role = .assistant,
+            .content = try self.allocator.dupe(u8, summary_text),
+        });
+
+        // Compact/trim history so the next turn doesn't start with bloated context
+        self.last_turn_compacted = self.autoCompactHistory() catch false;
+        self.trimHistory();
+
+        const complete_event = ObserverEvent{ .turn_complete = {} };
+        self.observer.recordEvent(&complete_event);
+
+        return prefixed;
     }
 
     /// Execute a tool by name lookup.
@@ -1702,7 +1770,7 @@ test "Agent buildMessageSlice" {
 }
 
 test "Agent max_tool_iterations default" {
-    try std.testing.expectEqual(@as(u32, 10), DEFAULT_MAX_TOOL_ITERATIONS);
+    try std.testing.expectEqual(@as(u32, 25), DEFAULT_MAX_TOOL_ITERATIONS);
 }
 
 test "Agent max_history default" {
