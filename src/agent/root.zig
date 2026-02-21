@@ -67,6 +67,11 @@ pub const Agent = struct {
     /// Optional security policy for autonomy checks and rate limiting.
     policy: ?*const SecurityPolicy = null,
 
+    /// Owner user ID (from config security.owner_id). Only this user can use privileged tools.
+    owner_id: []const u8 = "",
+    /// Current message sender ID (set per-turn by SessionManager). Cleared after each turn.
+    current_sender_id: []const u8 = "",
+
     /// Optional streaming callback. When set, turn() uses streamChat() for streaming providers.
     stream_callback: ?providers.StreamCallback = null,
     /// Context pointer passed to stream_callback.
@@ -140,6 +145,7 @@ pub const Agent = struct {
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
+            .owner_id = cfg.security.owner_id,
             .history = .empty,
             .total_tokens = 0,
             .has_system_prompt = false,
@@ -697,9 +703,45 @@ pub const Agent = struct {
         return prefixed;
     }
 
+    /// Tools that any user may invoke (safe for public use).
+    const safe_tools = [_][]const u8{
+        "web_search",
+        "web_fetch",
+        "http_request",
+        "memory_store",
+        "memory_recall",
+        "memory_forget",
+        "message",
+    };
+
+    /// Check whether a tool name is in the safe (public) list.
+    fn isSafeTool(name: []const u8) bool {
+        for (safe_tools) |safe| {
+            if (std.mem.eql(u8, name, safe)) return true;
+        }
+        return false;
+    }
+
+    /// Check whether the current sender is the owner.
+    fn isOwner(self: *const Agent) bool {
+        if (self.owner_id.len == 0) return true; // no owner configured = unrestricted
+        if (self.current_sender_id.len == 0) return true; // CLI / no sender context = unrestricted
+        return std.mem.eql(u8, self.current_sender_id, self.owner_id);
+    }
+
     /// Execute a tool by name lookup.
     /// Parses arguments_json once into a std.json.ObjectMap and passes it to the tool.
     fn executeTool(self: *Agent, call: ParsedToolCall) ToolExecutionResult {
+        // Owner gate: non-owners can only use safe tools
+        if (!self.isOwner() and !isSafeTool(call.name)) {
+            return .{
+                .name = call.name,
+                .output = "Permission denied: this tool is restricted to the bot owner.",
+                .success = false,
+                .tool_call_id = call.tool_call_id,
+            };
+        }
+
         // Policy gate: check autonomy and rate limit
         if (self.policy) |pol| {
             if (!pol.canAct()) {

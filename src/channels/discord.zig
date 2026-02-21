@@ -159,6 +159,28 @@ pub const DiscordChannel = struct {
         return false;
     }
 
+    /// Check if this message is a reply to a message authored by the bot.
+    /// Inspects d.referenced_message.author.id in the MESSAGE_CREATE payload.
+    pub fn isReplyToBot(d_obj: std.json.ObjectMap, bot_user_id: []const u8) bool {
+        if (bot_user_id.len == 0) return false;
+        const ref_msg = d_obj.get("referenced_message") orelse return false;
+        const ref_obj = switch (ref_msg) {
+            .object => |o| o,
+            else => return false,
+        };
+        const ref_author = ref_obj.get("author") orelse return false;
+        const ref_author_obj = switch (ref_author) {
+            .object => |o| o,
+            else => return false,
+        };
+        const ref_author_id = ref_author_obj.get("id") orelse return false;
+        const ref_id_str = switch (ref_author_id) {
+            .string => |s| s,
+            else => return false,
+        };
+        return std.mem.eql(u8, ref_id_str, bot_user_id);
+    }
+
     // ── Channel vtable ──────────────────────────────────────────────
 
     /// Send a message to a Discord channel via REST API.
@@ -211,7 +233,7 @@ pub const DiscordChannel = struct {
         const fd = self.ws_fd.load(.acquire);
         if (fd >= 0) {
             if (comptime builtin.os.tag != .windows) {
-                std.posix.close(@intCast(fd)) catch {};
+                std.posix.close(@intCast(fd));
             }
         }
         if (self.gateway_thread) |t| {
@@ -325,11 +347,8 @@ pub const DiscordChannel = struct {
             const maybe_text = ws.readTextMessage() catch break;
             const text = maybe_text orelse break;
             defer self.allocator.free(text);
-            self.handleGatewayMessage(&ws, text) catch |err| {
-                switch (err) {
-                    error.ShouldReconnect => break,
-                    else => log.err("Discord gateway msg error: {}", .{err}),
-                }
+            self.handleGatewayMessage(&ws, text) catch |err| switch (err) {
+                error.ShouldReconnect => break,
             };
         }
     }
@@ -627,9 +646,12 @@ pub const DiscordChannel = struct {
         }
 
         // Filter 2: mention_only for guild (non-DM) messages
+        // Pass if: @mentioned, or replying to a bot message, or DM
         if (self.mention_only and guild_id != null) {
             const bot_uid = self.bot_user_id orelse "";
-            if (!isMentioned(content, bot_uid)) {
+            const is_mentioned = isMentioned(content, bot_uid);
+            const is_reply_to_bot = isReplyToBot(d_obj, bot_uid);
+            if (!is_mentioned and !is_reply_to_bot) {
                 return;
             }
         }

@@ -717,6 +717,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     }
                 }
             }
+            if (sec.object.get("owner_id")) |v| {
+                if (v == .string) self.security.owner_id = try self.allocator.dupe(u8, v.string);
+            }
             if (sec.object.get("audit")) |aud| {
                 if (aud == .object) {
                     if (aud.object.get("enabled")) |v| {

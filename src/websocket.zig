@@ -132,13 +132,18 @@ pub const WsClient = struct {
         try tls_state.tls_client.writer.flush();
         try tls_state.stream_writer.interface.flush();
 
-        // Read HTTP 101 response
+        // Read HTTP 101 response using peek/toss (Zig 0.15 Reader API)
         var resp_buf: [4096]u8 = undefined;
         var resp_len: usize = 0;
         while (resp_len < resp_buf.len) {
-            const n = tls_state.tls_client.reader.read(resp_buf[resp_len..]) catch
+            const data = tls_state.tls_client.reader.peek(1) catch
                 return error.WsHandshakeFailed;
-            if (n == 0) return error.WsHandshakeFailed;
+            if (data.len == 0) return error.WsHandshakeFailed;
+            // peekGreedy may return more bytes — copy as many as we can
+            const avail = tls_state.tls_client.reader.buffered();
+            const n = @min(avail.len, resp_buf.len - resp_len);
+            @memcpy(resp_buf[resp_len..][0..n], avail[0..n]);
+            tls_state.tls_client.reader.toss(n);
             resp_len += n;
             if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n") != null) break;
         }
@@ -179,8 +184,13 @@ pub const WsClient = struct {
     fn readExact(self: *WsClient, buf: []u8) !void {
         var total: usize = 0;
         while (total < buf.len) {
-            const n = self.tls.tls_client.reader.read(buf[total..]) catch |err| return err;
-            if (n == 0) return error.ConnectionClosed;
+            const needed = buf.len - total;
+            const data = self.tls.tls_client.reader.peek(1) catch return error.ConnectionClosed;
+            if (data.len == 0) return error.ConnectionClosed;
+            const avail = self.tls.tls_client.reader.buffered();
+            const n = @min(avail.len, needed);
+            @memcpy(buf[total..][0..n], avail[0..n]);
+            self.tls.tls_client.reader.toss(n);
             total += n;
         }
     }
@@ -343,7 +353,7 @@ pub const WsClient = struct {
                         message.deinit(self.allocator);
                         return error.MessageTooLarge;
                     }
-                    if (frame.fin) return message.toOwnedSlice(self.allocator);
+                    if (frame.fin) return @as(?[]u8, try message.toOwnedSlice(self.allocator));
                 },
                 .ping => {}, // auto-handled inside readFrame
                 .binary => {}, // Discord uses text only

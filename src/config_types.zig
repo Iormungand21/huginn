@@ -405,6 +405,8 @@ pub const SecurityConfig = struct {
     sandbox: SandboxConfig = .{},
     resources: ResourceLimitsConfig = .{},
     audit: AuditConfig = .{},
+    /// Discord/Telegram user ID of the bot owner. Only this user can use privileged tools.
+    owner_id: []const u8 = "",
 };
 
 // ── Delegate agent config ───────────────────────────────────────

@@ -145,10 +145,19 @@ pub const SessionManager = struct {
     /// Process a message within a session context.
     /// Finds or creates the session, locks it, runs agent.turn(), returns owned response.
     pub fn processMessage(self: *SessionManager, session_key: []const u8, content: []const u8) ![]const u8 {
+        return self.processMessageFrom(session_key, content, "");
+    }
+
+    /// Process a message with sender identity for tool-level authorization.
+    pub fn processMessageFrom(self: *SessionManager, session_key: []const u8, content: []const u8, sender_id: []const u8) ![]const u8 {
         const session = try self.getOrCreate(session_key);
 
         session.mutex.lock();
         defer session.mutex.unlock();
+
+        // Set sender context on agent for tool authorization
+        session.agent.current_sender_id = sender_id;
+        defer session.agent.current_sender_id = "";
 
         const response = try session.agent.turn(content);
         session.turn_count += 1;

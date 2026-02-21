@@ -348,7 +348,15 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         std.debug.print("  Lark:      {s}\n", .{if (cfg.channels.lark != null) "configured" else "not configured"});
         std.debug.print("  DingTalk:  {s}\n", .{if (cfg.channels.dingtalk != null) "configured" else "not configured"});
     } else if (std.mem.eql(u8, subcmd, "start")) {
-        try runChannelStart(allocator, sub_args[1..]);
+        if (cfg.channels.telegram != null) {
+            try runChannelStart(allocator, sub_args[1..]);
+        } else if (cfg.channels.discord != null) {
+            try runDiscordChannelStart(allocator, sub_args[1..]);
+        } else {
+            std.debug.print("No channel configured. Add telegram or discord to your config.json:\n", .{});
+            std.debug.print("  \"channels\": {{\"discord\": {{\"accounts\": {{\"main\": {{\"token\": \"...\"}}}}}}}}\n", .{});
+            std.process.exit(1);
+        }
     } else if (std.mem.eql(u8, subcmd, "doctor")) {
         std.debug.print("Channel health:\n", .{});
         std.debug.print("  CLI:      ok\n", .{});
@@ -901,6 +909,190 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         }
 
         // Periodically evict sessions idle longer than the configured timeout
+        evict_counter += 1;
+        if (evict_counter >= 100) {
+            evict_counter = 0;
+            _ = session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
+        }
+    }
+}
+
+// ── Channel Start (Discord bot loop) ─────────────────────────────
+
+fn runDiscordChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    // Load config
+    var config = yc.config.Config.load(allocator) catch {
+        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+        std.process.exit(1);
+    };
+    defer config.deinit();
+
+    const discord_config = config.channels.discord orelse {
+        std.debug.print("Discord not configured. Add to config.json:\n", .{});
+        std.debug.print("  \"channels\": {{\"discord\": {{\"accounts\": {{\"main\": {{\"token\": \"...\"}}}}}}}}\n", .{});
+        std.process.exit(1);
+    };
+
+    // Determine allowed users: --user CLI args override config allow_from
+    var user_list: std.ArrayList([]const u8) = .empty;
+    defer user_list.deinit(allocator);
+    {
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--user") and i + 1 < args.len) {
+                i += 1;
+                user_list.append(allocator, args[i]) catch |err| log.err("failed to append user: {}", .{err});
+            }
+        }
+    }
+    const allowed: []const []const u8 = if (user_list.items.len > 0)
+        user_list.items
+    else
+        discord_config.allow_from;
+
+    // OAuth providers (openai-codex) don't need an API key
+    const provider_kind = yc.providers.classifyProvider(config.default_provider);
+    if (config.defaultProviderKey() == null and provider_kind != .openai_codex_provider) {
+        std.debug.print("No API key configured. Add to ~/.nullclaw/config.json:\n", .{});
+        std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
+        std.process.exit(1);
+    }
+
+    const model = config.default_model orelse "anthropic/claude-3.5-sonnet";
+    const temperature = config.default_temperature;
+
+    std.debug.print("nullclaw discord bot starting...\n", .{});
+    std.debug.print("  Provider: {s}\n", .{config.default_provider});
+    std.debug.print("  Model: {s}\n", .{model});
+    std.debug.print("  Temperature: {d:.1}\n", .{temperature});
+    if (allowed.len == 0) {
+        std.debug.print("  Allowed users: (all)\n", .{});
+    } else {
+        std.debug.print("  Allowed users:", .{});
+        for (allowed) |u| {
+            std.debug.print(" {s}", .{u});
+        }
+        std.debug.print("\n", .{});
+    }
+    std.debug.print("  Mention only: {s}\n", .{if (discord_config.mention_only) "yes" else "no"});
+
+    // Initialize MCP tools from config
+    const mcp_tools: ?[]const yc.tools.Tool = if (config.mcp_servers.len > 0)
+        yc.mcp.initMcpTools(allocator, config.mcp_servers) catch |err| blk: {
+            std.debug.print("  MCP: init failed: {}\n", .{err});
+            break :blk null;
+        }
+    else
+        null;
+
+    // Build security policy from config
+    const security = @import("nullclaw").security.policy;
+    var tracker = security.RateTracker.init(allocator, config.autonomy.max_actions_per_hour);
+    defer tracker.deinit();
+
+    var sec_policy = security.SecurityPolicy{
+        .autonomy = config.autonomy.level,
+        .workspace_dir = config.workspace_dir,
+        .workspace_only = config.autonomy.workspace_only,
+        .allowed_commands = if (config.autonomy.allowed_commands.len > 0) config.autonomy.allowed_commands else &security.default_allowed_commands,
+        .max_actions_per_hour = config.autonomy.max_actions_per_hour,
+        .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
+        .block_high_risk_commands = config.autonomy.block_high_risk_commands,
+        .tracker = &tracker,
+    };
+
+    // Create tools (for system prompt and tool calling)
+    const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
+        .http_enabled = config.http_request.enabled,
+        .browser_enabled = config.browser.enabled,
+        .screenshot_enabled = true,
+        .mcp_tools = mcp_tools,
+        .agents = config.agents,
+        .fallback_api_key = config.defaultProviderKey(),
+        .tools_config = config.tools,
+        .allowed_paths = config.autonomy.allowed_paths,
+        .policy = &sec_policy,
+    }) catch &.{};
+    defer if (tools.len > 0) allocator.free(tools);
+
+    if (mcp_tools) |mt| {
+        std.debug.print("  MCP tools: {d}\n", .{mt.len});
+    }
+
+    // Create optional memory backend (don't fail if unavailable)
+    var mem_opt: ?yc.memory.Memory = null;
+    const db_path = std.fs.path.joinZ(allocator, &.{ config.workspace_dir, "memory.db" }) catch null;
+    defer if (db_path) |p| allocator.free(p);
+    if (db_path) |p| {
+        if (yc.memory.createMemory(allocator, config.memory.backend, p)) |mem| {
+            mem_opt = mem;
+        } else |_| {}
+    }
+
+    // Create noop observer
+    var noop_obs = yc.observability.NoopObserver{};
+    const obs = noop_obs.observer();
+
+    // Create provider vtable
+    var holder = yc.providers.ProviderHolder.fromConfig(allocator, config.default_provider, config.defaultProviderKey(), config.getProviderBaseUrl(config.default_provider));
+    const provider_i: yc.providers.Provider = holder.provider();
+
+    std.debug.print("  Tools: {d} loaded\n", .{tools.len});
+    std.debug.print("  Memory: {s}\n", .{if (mem_opt != null) "enabled" else "disabled"});
+
+    // Create bus for Discord gateway ↔ consumer communication
+    var bus = yc.bus.Bus.init();
+
+    // Create Discord channel and wire up bus + config
+    var discord = yc.channels.discord.DiscordChannel.init(allocator, discord_config.token, discord_config.guild_id, discord_config.allow_bots);
+    discord.bus = &bus;
+    discord.allow_from = allowed;
+    discord.mention_only = discord_config.mention_only;
+    discord.intents = discord_config.intents;
+
+    // Start gateway (spawns WebSocket + heartbeat threads)
+    var ch = discord.channel();
+    try ch.start();
+    defer ch.stop();
+
+    std.debug.print("  Gateway connected. Listening for messages... (Ctrl+C to stop)\n\n", .{});
+
+    var session_mgr = yc.session.SessionManager.init(allocator, &config, provider_i, tools, mem_opt, obs);
+    session_mgr.policy = &sec_policy;
+    defer session_mgr.deinit();
+
+    var evict_counter: u32 = 0;
+
+    // Consumer loop: read from bus → process → reply via REST API
+    while (true) {
+        const maybe_msg = bus.consumeInbound();
+        const msg = maybe_msg orelse {
+            // Bus closed — shutting down
+            break;
+        };
+        defer msg.deinit(allocator);
+
+        std.debug.print("[discord] {s}: {s}\n", .{ msg.sender_id, msg.content });
+
+        const reply = session_mgr.processMessageFrom(msg.session_key, msg.content, msg.sender_id) catch |err| {
+            std.debug.print("  Agent error: {}\n", .{err});
+            const err_msg = switch (err) {
+                error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
+                error.OutOfMemory => "Out of memory.",
+                else => "An error occurred. Try again.",
+            };
+            discord.sendMessage(msg.chat_id, err_msg) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
+            continue;
+        };
+        defer allocator.free(reply);
+
+        std.debug.print("  -> {s}\n", .{reply});
+
+        discord.sendMessage(msg.chat_id, reply) catch |err| {
+            std.debug.print("  Send error: {}\n", .{err});
+        };
+
+        // Periodically evict idle sessions
         evict_counter += 1;
         if (evict_counter >= 100) {
             evict_counter = 0;
