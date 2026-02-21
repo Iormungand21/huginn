@@ -249,17 +249,21 @@ pub const ProviderHolder = union(enum) {
 
     /// Create a ProviderHolder from a provider name string and optional API key.
     /// Uses `classifyProvider` to route to the correct concrete provider.
+    /// `base_url` overrides the provider's default endpoint (from config's models.providers.X.base_url).
     pub fn fromConfig(
         allocator: std.mem.Allocator,
         provider_name: []const u8,
         api_key: ?[]const u8,
+        base_url: ?[]const u8,
     ) ProviderHolder {
         const kind = classifyProvider(provider_name);
         return switch (kind) {
             .anthropic_provider => .{ .anthropic = anthropic.AnthropicProvider.init(
                 allocator,
                 api_key,
-                if (std.mem.startsWith(u8, provider_name, "anthropic-custom:"))
+                if (base_url) |url|
+                    url
+                else if (std.mem.startsWith(u8, provider_name, "anthropic-custom:"))
                     provider_name["anthropic-custom:".len..]
                 else
                     null,
@@ -410,39 +414,43 @@ test "ProviderHolder tagged union has all expected fields" {
 test "ProviderHolder.fromConfig routes to correct variant" {
     const alloc = std.testing.allocator;
     // anthropic
-    var h1 = ProviderHolder.fromConfig(alloc, "anthropic", "sk-test");
+    var h1 = ProviderHolder.fromConfig(alloc, "anthropic", "sk-test", null);
     defer h1.deinit();
     try std.testing.expect(h1 == .anthropic);
     // openai
-    var h2 = ProviderHolder.fromConfig(alloc, "openai", "sk-test");
+    var h2 = ProviderHolder.fromConfig(alloc, "openai", "sk-test", null);
     defer h2.deinit();
     try std.testing.expect(h2 == .openai);
     // gemini
-    var h3 = ProviderHolder.fromConfig(alloc, "gemini", "key");
+    var h3 = ProviderHolder.fromConfig(alloc, "gemini", "key", null);
     defer h3.deinit();
     try std.testing.expect(h3 == .gemini);
     // ollama
-    var h4 = ProviderHolder.fromConfig(alloc, "ollama", null);
+    var h4 = ProviderHolder.fromConfig(alloc, "ollama", null, null);
     defer h4.deinit();
     try std.testing.expect(h4 == .ollama);
     // openrouter
-    var h5 = ProviderHolder.fromConfig(alloc, "openrouter", "sk-or-test");
+    var h5 = ProviderHolder.fromConfig(alloc, "openrouter", "sk-or-test", null);
     defer h5.deinit();
     try std.testing.expect(h5 == .openrouter);
     // compatible (groq)
-    var h6 = ProviderHolder.fromConfig(alloc, "groq", "gsk_test");
+    var h6 = ProviderHolder.fromConfig(alloc, "groq", "gsk_test", null);
     defer h6.deinit();
     try std.testing.expect(h6 == .compatible);
     // openai-codex
-    var h7 = ProviderHolder.fromConfig(alloc, "openai-codex", null);
+    var h7 = ProviderHolder.fromConfig(alloc, "openai-codex", null, null);
     defer h7.deinit();
     try std.testing.expect(h7 == .openai_codex);
     // unknown falls back to openrouter
-    var h8 = ProviderHolder.fromConfig(alloc, "nonexistent", "key");
+    var h8 = ProviderHolder.fromConfig(alloc, "nonexistent", "key", null);
     defer h8.deinit();
     try std.testing.expect(h8 == .openrouter);
     // anthropic-custom prefix
-    var h9 = ProviderHolder.fromConfig(alloc, "anthropic-custom:https://my-api.example.com", "sk-test");
+    var h9 = ProviderHolder.fromConfig(alloc, "anthropic-custom:https://my-api.example.com", "sk-test", null);
     defer h9.deinit();
     try std.testing.expect(h9 == .anthropic);
+    // anthropic with explicit base_url
+    var h10 = ProviderHolder.fromConfig(alloc, "anthropic", "sk-test", "https://api.kimi.com/coding");
+    defer h10.deinit();
+    try std.testing.expect(h10 == .anthropic);
 }

@@ -215,17 +215,20 @@ pub fn parseAnthropicSseLine(allocator: std.mem.Allocator, line: []const u8, cur
     if (trimmed.len == 0) return .skip;
     if (trimmed[0] == ':') return .skip;
 
-    // Handle "event: TYPE" lines
-    const event_prefix = "event: ";
-    if (std.mem.startsWith(u8, trimmed, event_prefix)) {
-        return .{ .event = trimmed[event_prefix.len..] };
+    // Handle "event:" lines (with or without space after colon)
+    if (std.mem.startsWith(u8, trimmed, "event:")) {
+        const rest = trimmed["event:".len..];
+        const value = if (rest.len > 0 and rest[0] == ' ') rest[1..] else rest;
+        return .{ .event = value };
     }
 
-    // Handle "data: {JSON}" lines
-    const data_prefix = "data: ";
-    if (!std.mem.startsWith(u8, trimmed, data_prefix)) return .skip;
-
-    const data = trimmed[data_prefix.len..];
+    // Handle "data:" lines (with or without space after colon)
+    const data = if (std.mem.startsWith(u8, trimmed, "data: "))
+        trimmed["data: ".len..]
+    else if (std.mem.startsWith(u8, trimmed, "data:"))
+        trimmed["data:".len..]
+    else
+        return .skip;
 
     if (std.mem.eql(u8, current_event, "message_stop")) return .done;
 
