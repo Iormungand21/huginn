@@ -1074,7 +1074,23 @@ fn runDiscordChannelStart(allocator: std.mem.Allocator, args: []const []const u8
 
         std.debug.print("[discord] {s}: {s}\n", .{ msg.sender_id, msg.content });
 
-        const reply = session_mgr.processMessageFrom(msg.session_key, msg.content, msg.sender_id) catch |err| {
+        // Extract message_id from metadata for reaction support
+        const message_id: ?[]const u8 = if (msg.metadata_json) |md| blk: {
+            const md_parsed = std.json.parseFromSlice(std.json.Value, allocator, md, .{}) catch break :blk null;
+            defer md_parsed.deinit();
+            break :blk if (md_parsed.value.object.get("message_id")) |v| switch (v) {
+                .string => |s| if (s.len > 0) (allocator.dupe(u8, s) catch null) else null,
+                else => null,
+            } else null;
+        } else null;
+        defer if (message_id) |mid| allocator.free(mid);
+
+        // Add eyes emoji reaction to indicate we're processing
+        if (message_id) |mid| {
+            discord.addReaction(msg.chat_id, mid, "%F0%9F%91%80");
+        }
+
+        const raw_reply = session_mgr.processMessageFrom(msg.session_key, msg.content, msg.sender_id) catch |err| {
             std.debug.print("  Agent error: {}\n", .{err});
             const err_msg = switch (err) {
                 error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
@@ -1084,13 +1100,40 @@ fn runDiscordChannelStart(allocator: std.mem.Allocator, args: []const []const u8
             discord.sendMessage(msg.chat_id, err_msg) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
             continue;
         };
-        defer allocator.free(reply);
 
-        std.debug.print("  -> {s}\n", .{reply});
+        // Check for conversation mode markers and strip them
+        var reply: []const u8 = raw_reply;
+        var reply_is_owned = false; // true if reply is a separate allocation from raw_reply
+        if (std.mem.indexOf(u8, raw_reply, "[CONV_MODE:on]")) |pos| {
+            discord.setConversationMode(msg.chat_id);
+            const stripped = std.fmt.allocPrint(allocator, "{s}{s}", .{ raw_reply[0..pos], raw_reply[pos + "[CONV_MODE:on]".len ..] }) catch null;
+            if (stripped) |s| {
+                reply = s;
+                reply_is_owned = true;
+            }
+        } else if (std.mem.indexOf(u8, raw_reply, "[CONV_MODE:off]")) |pos| {
+            discord.clearConversationMode(msg.chat_id);
+            const stripped = std.fmt.allocPrint(allocator, "{s}{s}", .{ raw_reply[0..pos], raw_reply[pos + "[CONV_MODE:off]".len ..] }) catch null;
+            if (stripped) |s| {
+                reply = s;
+                reply_is_owned = true;
+            }
+        }
+        defer {
+            if (reply_is_owned) allocator.free(reply);
+            allocator.free(raw_reply);
+        }
 
-        discord.sendMessage(msg.chat_id, reply) catch |err| {
-            std.debug.print("  Send error: {}\n", .{err});
-        };
+        // Trim whitespace from stripped reply
+        const trimmed_reply = std.mem.trim(u8, reply, " \t\r\n");
+
+        std.debug.print("  -> {s}\n", .{trimmed_reply});
+
+        if (trimmed_reply.len > 0) {
+            discord.sendMessage(msg.chat_id, trimmed_reply) catch |err| {
+                std.debug.print("  Send error: {}\n", .{err});
+            };
+        }
 
         // Periodically evict idle sessions
         evict_counter += 1;

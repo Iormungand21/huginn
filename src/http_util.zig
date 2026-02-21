@@ -158,6 +158,51 @@ pub fn curlGet(allocator: Allocator, url: []const u8, headers: []const []const u
     return curlGetWithProxy(allocator, url, headers, timeout_secs, null);
 }
 
+/// HTTP PUT with empty body via curl subprocess.
+///
+/// Used for APIs that use PUT with no request body (e.g. Discord reactions).
+/// `headers` is a slice of header strings (e.g. `"Authorization: Bot xxx"`).
+pub fn curlPutEmpty(allocator: Allocator, url: []const u8, headers: []const []const u8) !void {
+    var argv_buf: [20][]const u8 = undefined;
+    var argc: usize = 0;
+
+    argv_buf[argc] = "curl";
+    argc += 1;
+    argv_buf[argc] = "-s";
+    argc += 1;
+    argv_buf[argc] = "-X";
+    argc += 1;
+    argv_buf[argc] = "PUT";
+    argc += 1;
+    argv_buf[argc] = "-H";
+    argc += 1;
+    argv_buf[argc] = "Content-Length: 0";
+    argc += 1;
+
+    for (headers) |hdr| {
+        if (argc + 2 > argv_buf.len) break;
+        argv_buf[argc] = "-H";
+        argc += 1;
+        argv_buf[argc] = hdr;
+        argc += 1;
+    }
+
+    argv_buf[argc] = url;
+    argc += 1;
+
+    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+
+    try child.spawn();
+
+    const term = child.wait() catch return error.CurlWaitError;
+    switch (term) {
+        .Exited => |code| if (code != 0) return error.CurlFailed,
+        else => return error.CurlFailed,
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 test "curlPost builds correct argv structure" {

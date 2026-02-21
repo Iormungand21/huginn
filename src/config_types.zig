@@ -156,7 +156,7 @@ pub const DiscordConfig = struct {
     guild_id: ?[]const u8 = null,
     allow_bots: bool = false,
     allow_from: []const []const u8 = &.{},
-    mention_only: bool = false,
+    mention_only: bool = true,
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
 };
 

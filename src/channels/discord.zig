@@ -16,9 +16,12 @@ pub const DiscordChannel = struct {
 
     // Optional gateway fields (have defaults so existing init works)
     allow_from: []const []const u8 = &.{},
-    mention_only: bool = false,
+    mention_only: bool = true,
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
     bus: ?*bus_mod.Bus = null,
+
+    // Conversation mode — channels where bot responds to all messages
+    conversation_channels: std.StringHashMapUnmanaged(void) = .empty,
 
     // Gateway state
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -143,6 +146,37 @@ pub const DiscordChannel = struct {
         return no_scheme[0..end];
     }
 
+    /// Strip the bot's own mention (<@BOT_ID> or <@!BOT_ID>) from message content.
+    /// Returns a newly allocated string with the mention removed, or the original if no mention found.
+    fn stripBotMention(self: *DiscordChannel, content: []const u8, bot_uid: []const u8) ![]const u8 {
+        if (bot_uid.len == 0) return content;
+
+        // Try <@BOT_ID> first, then <@!BOT_ID>
+        var buf1: [64]u8 = undefined;
+        const mention1 = std.fmt.bufPrint(&buf1, "<@{s}>", .{bot_uid}) catch return content;
+        var buf2: [64]u8 = undefined;
+        const mention2 = std.fmt.bufPrint(&buf2, "<@!{s}>", .{bot_uid}) catch return content;
+
+        const mention = if (std.mem.indexOf(u8, content, mention1) != null)
+            mention1
+        else if (std.mem.indexOf(u8, content, mention2) != null)
+            mention2
+        else
+            return content;
+
+        const pos = std.mem.indexOf(u8, content, mention).?;
+        const before = content[0..pos];
+        const after = content[pos + mention.len ..];
+        const result = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ before, after });
+        // Trim leading/trailing whitespace from the result
+        const trimmed = std.mem.trim(u8, result, " ");
+        if (trimmed.len == result.len) return result;
+        // Re-allocate trimmed version and free the original
+        const trimmed_copy = try self.allocator.dupe(u8, trimmed);
+        self.allocator.free(result);
+        return trimmed_copy;
+    }
+
     /// Check if bot is mentioned in message content.
     /// Returns true if "<@BOT_ID>" or "<@!BOT_ID>" appears in content.
     pub fn isMentioned(content: []const u8, bot_user_id: []const u8) bool {
@@ -217,6 +251,54 @@ pub const DiscordChannel = struct {
         self.allocator.free(resp);
     }
 
+    // ── Reactions ─────────────────────────────────────────────────────
+
+    /// Add an emoji reaction to a message via Discord REST API.
+    /// `emoji` should be URL-encoded (e.g. "%F0%9F%91%80" for eyes).
+    pub fn addReaction(self: *DiscordChannel, channel_id: []const u8, message_id: []const u8, emoji: []const u8) void {
+        var url_buf: [512]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&url_buf);
+        fbs.writer().print(
+            "https://discord.com/api/v10/channels/{s}/messages/{s}/reactions/{s}/@me",
+            .{ channel_id, message_id, emoji },
+        ) catch return;
+        const url = fbs.getWritten();
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+        auth_fbs.writer().print("Authorization: Bot {s}", .{self.token}) catch return;
+        const auth_header = auth_fbs.getWritten();
+
+        root.http_util.curlPutEmpty(self.allocator, url, &.{auth_header}) catch |err| {
+            log.warn("Discord: failed to add reaction: {}", .{err});
+        };
+    }
+
+    // ── Conversation mode ───────────────────────────────────────────
+
+    /// Enable conversation mode for a channel (bot responds to all messages).
+    pub fn setConversationMode(self: *DiscordChannel, channel_id: []const u8) void {
+        if (self.conversation_channels.get(channel_id) != null) return; // already active
+        const key = self.allocator.dupe(u8, channel_id) catch return;
+        self.conversation_channels.put(self.allocator, key, {}) catch {
+            self.allocator.free(key);
+        };
+        log.info("Discord: conversation mode enabled for channel {s}", .{channel_id});
+    }
+
+    /// Disable conversation mode for a channel.
+    pub fn clearConversationMode(self: *DiscordChannel, channel_id: []const u8) void {
+        if (self.conversation_channels.fetchRemove(channel_id)) |entry| {
+            self.allocator.free(entry.key);
+            log.info("Discord: conversation mode disabled for channel {s}", .{channel_id});
+        }
+    }
+
+    /// Check if a channel has conversation mode active.
+    pub fn isConversationChannel(self: *DiscordChannel, channel_id: []const u8) bool {
+        return self.conversation_channels.get(channel_id) != null;
+    }
+
     // ── Gateway ──────────────────────────────────────────────────────
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
@@ -253,6 +335,12 @@ pub const DiscordChannel = struct {
             self.allocator.free(u);
             self.bot_user_id = null;
         }
+        // Free conversation mode channel keys
+        var conv_it = self.conversation_channels.keyIterator();
+        while (conv_it.next()) |key_ptr| {
+            self.allocator.free(key_ptr.*);
+        }
+        self.conversation_channels.deinit(self.allocator);
     }
 
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8) anyerror!void {
@@ -586,6 +674,12 @@ pub const DiscordChannel = struct {
             },
         };
 
+        // Extract message id
+        const message_id: []const u8 = if (d_obj.get("id")) |v| switch (v) {
+            .string => |s| s,
+            else => "",
+        } else "";
+
         // Extract channel_id
         const channel_id: []const u8 = if (d_obj.get("channel_id")) |v| switch (v) {
             .string => |s| s,
@@ -646,8 +740,8 @@ pub const DiscordChannel = struct {
         }
 
         // Filter 2: mention_only for guild (non-DM) messages
-        // Pass if: @mentioned, or replying to a bot message, or DM
-        if (self.mention_only and guild_id != null) {
+        // Pass if: @mentioned, replying to a bot message, DM, or conversation mode active
+        if (self.mention_only and guild_id != null and !self.isConversationChannel(channel_id)) {
             const bot_uid = self.bot_user_id orelse "";
             const is_mentioned = isMentioned(content, bot_uid);
             const is_reply_to_bot = isReplyToBot(d_obj, bot_uid);
@@ -663,19 +757,30 @@ pub const DiscordChannel = struct {
             }
         }
 
+        // Strip bot's own mention from content so the LLM sees clean text
+        const clean_content = if (self.bot_user_id) |bot_uid| self.stripBotMention(content, bot_uid) catch content else content;
+        const clean_content_owned = if (self.bot_user_id != null) !std.mem.eql(u8, @as([]const u8, clean_content), @as([]const u8, content)) else false;
+        defer if (clean_content_owned) self.allocator.free(clean_content);
+
         // Build session_key and publish to bus
         const session_key = try std.fmt.allocPrint(self.allocator, "discord:{s}", .{channel_id});
         defer self.allocator.free(session_key);
+
+        // Build metadata JSON with message_id for reaction support
+        var meta_buf: [256]u8 = undefined;
+        var meta_fbs = std.io.fixedBufferStream(&meta_buf);
+        meta_fbs.writer().print("{{\"message_id\":\"{s}\"}}", .{message_id}) catch {};
+        const metadata_json: ?[]const u8 = if (meta_fbs.pos > 0) meta_fbs.getWritten() else null;
 
         const msg = try bus_mod.makeInboundFull(
             self.allocator,
             "discord",
             author_id,
             channel_id,
-            content,
+            clean_content,
             session_key,
             &.{},
-            null,
+            metadata_json,
         );
 
         if (self.bus) |b| {
@@ -854,4 +959,46 @@ test "discord intent bitmask guilds" {
     try std.testing.expectEqual(@as(u32, 4096), 4096);
     // Default intents = 1|512|32768|4096 = 37377
     try std.testing.expectEqual(@as(u32, 37377), 1 | 512 | 32768 | 4096);
+}
+
+test "discord mention_only defaults to true" {
+    const ch = DiscordChannel.init(std.testing.allocator, "tok", null, false);
+    try std.testing.expect(ch.mention_only);
+}
+
+test "discord conversation mode set and clear" {
+    var ch = DiscordChannel.init(std.testing.allocator, "tok", null, false);
+    defer ch.conversation_channels.deinit(std.testing.allocator);
+
+    // Initially not in conversation mode
+    try std.testing.expect(!ch.isConversationChannel("chan123"));
+
+    // Enable conversation mode
+    ch.setConversationMode("chan123");
+    try std.testing.expect(ch.isConversationChannel("chan123"));
+    try std.testing.expect(!ch.isConversationChannel("other"));
+
+    // Disable conversation mode
+    ch.clearConversationMode("chan123");
+    try std.testing.expect(!ch.isConversationChannel("chan123"));
+}
+
+test "discord conversation mode double set is idempotent" {
+    var ch = DiscordChannel.init(std.testing.allocator, "tok", null, false);
+    defer ch.conversation_channels.deinit(std.testing.allocator);
+
+    ch.setConversationMode("chan1");
+    ch.setConversationMode("chan1"); // should not leak
+    try std.testing.expect(ch.isConversationChannel("chan1"));
+
+    ch.clearConversationMode("chan1");
+    try std.testing.expect(!ch.isConversationChannel("chan1"));
+}
+
+test "discord conversation mode clear nonexistent is safe" {
+    var ch = DiscordChannel.init(std.testing.allocator, "tok", null, false);
+    defer ch.conversation_channels.deinit(std.testing.allocator);
+
+    // Should not crash
+    ch.clearConversationMode("nonexistent");
 }
