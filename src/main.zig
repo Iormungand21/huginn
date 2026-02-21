@@ -110,7 +110,10 @@ pub fn main() !void {
 }
 
 fn printVersion() void {
-    std.debug.print("nullclaw {s}\n", .{yc.version.string});
+    var buf: [256]u8 = undefined;
+    var bw = std.fs.File.stdout().writer(&buf);
+    bw.interface.print("nullclaw {s}\n", .{yc.version.string}) catch return;
+    bw.interface.flush() catch return;
 }
 
 // ── Gateway ──────────────────────────────────────────────────────
