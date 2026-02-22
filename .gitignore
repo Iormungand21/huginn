@@ -15,3 +15,6 @@ reference/
 
 result
 .direnv/
+
+# Autonomous Claude runner runtime files
+automation/runtime/
