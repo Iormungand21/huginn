@@ -84,10 +84,90 @@ A `SyncMessage` is valid when:
 3. Exactly one payload (`memory`, `task`, or `event`) is set
 4. The payload kind matches `header.kind`
 
+## Federation: Handshake and Heartbeat (X3-SYNC-001)
+
+### Peer Connection Lifecycle (PeerState)
+
+Peers progress through a strict state machine:
+
+```
+disconnected ──> handshake_pending ──> connected ──> degraded ──> offline
+      ^               │                    │            │           │
+      │               │ (rejected/         │ (clean     │ (clean    │
+      └───────────────┘  timeout)          │  shutdown) │  shutdown)│
+      ^                                    │            │           │
+      └────────────────────────────────────┘────────────┘───────────┘
+                                           │            │
+                                           └────────────┘
+                                         (heartbeat recovered)
+```
+
+| State               | Description                                         |
+|---------------------|-----------------------------------------------------|
+| `disconnected`      | No connection. Initial and reset state.             |
+| `handshake_pending` | Handshake request sent, awaiting response.          |
+| `connected`         | Handshake complete, heartbeats flowing normally.    |
+| `degraded`          | Heartbeat(s) missed, not yet timed out.             |
+| `offline`           | Peer unreachable (exceeded heartbeat timeout).      |
+
+### Handshake Flow
+
+1. **Initiator** sends `HandshakeRequest` with its `NodeId`, `schema_version`, and `last_seen_sequence`.
+2. **Responder** checks version compatibility and sends `HandshakeResponse` with a `HandshakeResult`:
+   - `accepted` — versions match, peer is allowed.
+   - `rejected` — peer declined (policy, unknown node). Includes `reason`.
+   - `version_mismatch` — incompatible schema versions.
+3. On `accepted`, both peers transition to `connected` and begin heartbeat exchange.
+
+| Field (Request)      | Type           | Description                          |
+|----------------------|----------------|--------------------------------------|
+| `source_node`        | `NodeId`       | Initiating node                      |
+| `schema_version`     | `u32`          | Protocol version                     |
+| `timestamp`          | `Timestamp`    | Request creation time                |
+| `last_seen_sequence` | `SequenceNum`  | Last sequence seen from target (0=first contact) |
+
+| Field (Response)     | Type              | Description                       |
+|----------------------|-------------------|-----------------------------------|
+| `source_node`        | `NodeId`          | Responding node                   |
+| `schema_version`     | `u32`             | Protocol version                  |
+| `timestamp`          | `Timestamp`       | Response creation time            |
+| `result`             | `HandshakeResult` | accepted/rejected/version_mismatch|
+| `reason`             | `?[]const u8`     | Human-readable rejection reason   |
+| `last_seen_sequence` | `SequenceNum`     | Last sequence seen from initiator |
+
+### Heartbeat Protocol
+
+Connected peers exchange periodic `Heartbeat` messages to maintain liveness detection.
+
+| Field         | Type           | Description                              |
+|---------------|----------------|------------------------------------------|
+| `source_node` | `NodeId`       | Sending node                             |
+| `timestamp`   | `Timestamp`    | Heartbeat send time                      |
+| `sequence`    | `SequenceNum`  | Current sequence at sender               |
+| `uptime_ms`   | `u64`          | Node uptime in milliseconds              |
+
+**HeartbeatConfig** controls timing thresholds:
+
+| Field                  | Default  | Description                              |
+|------------------------|----------|------------------------------------------|
+| `interval_ms`          | 30,000   | Heartbeat send interval                  |
+| `degraded_after_missed`| 2        | Missed heartbeats before degraded state  |
+| `offline_after_missed` | 5        | Missed heartbeats before offline state   |
+
+### PeerInfo Tracking
+
+Each node maintains a `PeerInfo` record per known peer, tracking:
+- Current `PeerState` with enforced valid transitions
+- Last heartbeat timestamp and missed heartbeat count
+- Connection establishment timestamp
+- Last received sequence number (for gap detection)
+
+Recovery: receiving a heartbeat while in `degraded` state automatically returns to `connected`.
+
 ## Future Work
 
-- **X2-SYNC-001:** Conflict resolution policy (last-writer-wins, merge, reject)
-- **X3-SYNC-001:** Federated task routing, heartbeat messages, transport layer
 - Wire encoding format selection (JSON, CBOR, or custom binary)
+- Transport layer implementation (TCP, Unix socket, or mDNS discovery)
 - Batched delta messages for bulk sync
 - Compression for large payloads
+- Peer discovery and automatic reconnection

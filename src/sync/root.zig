@@ -5,12 +5,13 @@
 //!   - Node identity and sequence tracking (NodeId, SequenceNum, SyncCursor)
 //!   - Typed delta payloads (MemoryDelta, TaskDelta, EventDelta)
 //!   - Top-level wire message (SyncMessage) with validation
-//!
-//! Transport and conflict resolution are deferred to later sync stages.
+//!   - Conflict resolution policies (full_precedence, last_writer_wins, etc.)
+//!   - Federated handshake, heartbeat, and peer state management
 
 pub const types = @import("types.zig");
 pub const protocol = @import("protocol.zig");
 pub const conflict = @import("conflict.zig");
+pub const federation = @import("federation.zig");
 
 // Re-export core types for convenient access
 pub const SCHEMA_VERSION = types.SCHEMA_VERSION;
@@ -41,8 +42,19 @@ pub const Side = conflict.Side;
 pub const resolve = conflict.resolve;
 pub const resolveWith = conflict.resolveWith;
 
+// Re-export federation types
+pub const PeerState = federation.PeerState;
+pub const HandshakeResult = federation.HandshakeResult;
+pub const HandshakeRequest = federation.HandshakeRequest;
+pub const HandshakeResponse = federation.HandshakeResponse;
+pub const Heartbeat = federation.Heartbeat;
+pub const HeartbeatConfig = federation.HeartbeatConfig;
+pub const PeerInfo = federation.PeerInfo;
+pub const checkVersionCompatibility = federation.checkVersionCompatibility;
+
 test {
     _ = types;
     _ = protocol;
     _ = conflict;
+    _ = federation;
 }
