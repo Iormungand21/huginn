@@ -20,6 +20,7 @@ pub const vector = @import("vector.zig");
 pub const hygiene = @import("hygiene.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const types = @import("types.zig");
+pub const decay = @import("decay.zig");
 
 pub const SqliteMemory = sqlite.SqliteMemory;
 pub const MarkdownMemory = markdown.MarkdownMemory;
@@ -41,6 +42,14 @@ pub const MemoryKind = types.MemoryKind;
 pub const MemoryTier = types.MemoryTier;
 pub const SourceMeta = types.SourceMeta;
 pub const TypedRecord = types.TypedRecord;
+pub const DecayParams = decay.DecayParams;
+pub const decayedConfidence = decay.decayedConfidence;
+pub const effectiveConfidence = decay.effectiveConfidence;
+pub const recencyScore = decay.recencyScore;
+pub const kindRecencyScore = decay.kindRecencyScore;
+pub const combinedRelevance = decay.combinedRelevance;
+pub const defaultHalfLifeHours = decay.defaultHalfLifeHours;
+pub const tierMultiplier = decay.tierMultiplier;
 
 // ── Memory categories ──────────────────────────────────────────────
 
@@ -447,4 +456,5 @@ test {
     _ = hygiene;
     _ = snapshot;
     _ = types;
+    _ = decay;
 }
