@@ -45,6 +45,144 @@ pub const CommandRiskLevel = enum {
     }
 };
 
+/// Reason codes for policy denials — each maps to a specific enforcement rule.
+pub const DenyReason = enum {
+    /// Agent autonomy is set to read-only; no actions permitted.
+    read_only_mode,
+    /// Command exceeds the maximum analysis length (MAX_ANALYSIS_LEN).
+    oversized_command,
+    /// Subshell or variable expansion operator detected (backticks, $(...), ${...}).
+    subshell_expansion,
+    /// Process substitution operator detected (<(...) or >(...)).
+    process_substitution,
+    /// Windows %VAR% environment variable expansion detected.
+    windows_env_expansion,
+    /// The `tee` command can write to arbitrary files, bypassing redirect checks.
+    tee_blocked,
+    /// Single `&` enables background process chaining (escaped timeout expectations).
+    background_chaining,
+    /// Output redirection operator (`>` / `>>`) detected.
+    output_redirection,
+    /// Command basename is not in the configured allowlist.
+    command_not_in_allowlist,
+    /// Dangerous arguments detected for an otherwise-allowed command.
+    dangerous_arguments,
+    /// Empty or whitespace-only command submitted.
+    empty_command,
+    /// High-risk command blocked by policy configuration.
+    high_risk_blocked,
+    /// Supervised mode requires explicit approval for this risk level.
+    approval_required,
+    /// Action rate limit has been exceeded.
+    rate_limited,
+
+    pub fn toString(self: DenyReason) []const u8 {
+        return switch (self) {
+            .read_only_mode => "read_only_mode",
+            .oversized_command => "oversized_command",
+            .subshell_expansion => "subshell_expansion",
+            .process_substitution => "process_substitution",
+            .windows_env_expansion => "windows_env_expansion",
+            .tee_blocked => "tee_blocked",
+            .background_chaining => "background_chaining",
+            .output_redirection => "output_redirection",
+            .command_not_in_allowlist => "command_not_in_allowlist",
+            .dangerous_arguments => "dangerous_arguments",
+            .empty_command => "empty_command",
+            .high_risk_blocked => "high_risk_blocked",
+            .approval_required => "approval_required",
+            .rate_limited => "rate_limited",
+        };
+    }
+
+    pub fn fromString(s: []const u8) ?DenyReason {
+        const map = std.StaticStringMap(DenyReason).initComptime(.{
+            .{ "read_only_mode", .read_only_mode },
+            .{ "oversized_command", .oversized_command },
+            .{ "subshell_expansion", .subshell_expansion },
+            .{ "process_substitution", .process_substitution },
+            .{ "windows_env_expansion", .windows_env_expansion },
+            .{ "tee_blocked", .tee_blocked },
+            .{ "background_chaining", .background_chaining },
+            .{ "output_redirection", .output_redirection },
+            .{ "command_not_in_allowlist", .command_not_in_allowlist },
+            .{ "dangerous_arguments", .dangerous_arguments },
+            .{ "empty_command", .empty_command },
+            .{ "high_risk_blocked", .high_risk_blocked },
+            .{ "approval_required", .approval_required },
+            .{ "rate_limited", .rate_limited },
+        });
+        return map.get(s);
+    }
+
+    /// Human-readable explanation of the denial.
+    pub fn toMessage(self: DenyReason) []const u8 {
+        return switch (self) {
+            .read_only_mode => "Agent autonomy is set to read-only",
+            .oversized_command => "Command exceeds maximum analysis length",
+            .subshell_expansion => "Subshell or variable expansion operator detected",
+            .process_substitution => "Process substitution operator detected",
+            .windows_env_expansion => "Windows environment variable expansion detected",
+            .tee_blocked => "The tee command can write to arbitrary files",
+            .background_chaining => "Background process chaining with & is not allowed",
+            .output_redirection => "Output redirection operator is not allowed",
+            .command_not_in_allowlist => "Command is not in the allowed commands list",
+            .dangerous_arguments => "Dangerous arguments detected for this command",
+            .empty_command => "Empty or whitespace-only command",
+            .high_risk_blocked => "High-risk command is blocked by policy",
+            .approval_required => "Explicit approval required for this risk level",
+            .rate_limited => "Action rate limit exceeded",
+        };
+    }
+};
+
+/// Structured context for a policy denial — carries enough information
+/// for UI display, audit logging, and observability timeline events.
+pub const PolicyDenial = struct {
+    /// Why the command was denied.
+    reason: DenyReason,
+    /// The denied command (may be truncated for oversized inputs).
+    command: []const u8,
+    /// The specific rule element that triggered the denial (e.g. the
+    /// blocked operator, unrecognized basename, or dangerous argument).
+    matched_rule: ?[]const u8 = null,
+    /// Risk level if classification was reached before denial.
+    risk_level: ?CommandRiskLevel = null,
+
+    /// Human-readable explanation suitable for error messages and logs.
+    pub fn message(self: *const PolicyDenial) []const u8 {
+        return self.reason.toMessage();
+    }
+
+    /// Serialize to a JSONL fragment into the provided buffer.
+    /// Returns the written slice, or null if the buffer is too small.
+    pub fn formatJsonLine(self: *const PolicyDenial, buf: []u8) ?[]const u8 {
+        var stream = std.io.fixedBufferStream(buf);
+        const w = stream.writer();
+        w.writeAll("{\"reason\":\"") catch return null;
+        w.writeAll(self.reason.toString()) catch return null;
+        w.writeAll("\",\"message\":\"") catch return null;
+        w.writeAll(self.reason.toMessage()) catch return null;
+        w.writeByte('"') catch return null;
+        if (self.matched_rule) |rule| {
+            w.writeAll(",\"matched_rule\":\"") catch return null;
+            w.writeAll(rule) catch return null;
+            w.writeByte('"') catch return null;
+        }
+        if (self.risk_level) |rl| {
+            w.writeAll(",\"risk_level\":\"") catch return null;
+            w.writeAll(rl.toString()) catch return null;
+            w.writeByte('"') catch return null;
+        }
+        w.writeByte('}') catch return null;
+        return buf[0..stream.pos];
+    }
+};
+
+/// Callback type for observability hooks — invoked on every policy denial.
+/// Implementations must not fail; errors are swallowed (fire-and-forget).
+pub const DenyHookFn = *const fn (denial: *const PolicyDenial) void;
+
 /// High-risk commands that are always blocked/require elevated approval.
 const high_risk_commands = [_][]const u8{
     "rm",       "mkfs",         "dd",     "shutdown", "reboot", "halt",
@@ -69,6 +207,8 @@ pub const SecurityPolicy = struct {
     require_approval_for_medium_risk: bool = true,
     block_high_risk_commands: bool = true,
     tracker: ?*RateTracker = null,
+    /// Optional hook invoked on every policy denial (observability integration).
+    deny_hook: ?DenyHookFn = null,
 
     /// Classify command risk level.
     pub fn commandRiskLevel(self: *const SecurityPolicy, command: []const u8) CommandRiskLevel {
@@ -118,12 +258,15 @@ pub const SecurityPolicy = struct {
     }
 
     /// Validate full command execution policy (allowlist + risk gate).
+    /// Backward-compatible — returns error codes without structured context.
+    /// Prefer `checkCommandExecution` for new code that needs deny reasons.
     pub fn validateCommandExecution(
         self: *const SecurityPolicy,
         command: []const u8,
         approved: bool,
     ) error{ CommandNotAllowed, HighRiskBlocked, ApprovalRequired }!CommandRiskLevel {
-        if (!self.isCommandAllowed(command)) {
+        if (self.checkCommand(command)) |denial| {
+            _ = denial;
             return error.CommandNotAllowed;
         }
 
@@ -131,9 +274,19 @@ pub const SecurityPolicy = struct {
 
         if (risk == .high) {
             if (self.block_high_risk_commands) {
+                self.emitDenial(.{
+                    .reason = .high_risk_blocked,
+                    .command = command,
+                    .risk_level = .high,
+                });
                 return error.HighRiskBlocked;
             }
             if (self.autonomy == .supervised and !approved) {
+                self.emitDenial(.{
+                    .reason = .approval_required,
+                    .command = command,
+                    .risk_level = .high,
+                });
                 return error.ApprovalRequired;
             }
         }
@@ -143,32 +296,107 @@ pub const SecurityPolicy = struct {
             self.require_approval_for_medium_risk and
             !approved)
         {
+            self.emitDenial(.{
+                .reason = .approval_required,
+                .command = command,
+                .risk_level = .medium,
+            });
             return error.ApprovalRequired;
         }
 
         return risk;
     }
 
-    /// Check if a shell command is allowed.
+    /// Check if a shell command is allowed — returns `true` if allowed.
+    /// Backward-compatible wrapper around `checkCommand`.
     pub fn isCommandAllowed(self: *const SecurityPolicy, command: []const u8) bool {
-        if (self.autonomy == .read_only) return false;
+        return self.checkCommand(command) == null;
+    }
+
+    /// Structured command check — returns a `PolicyDenial` with reason and
+    /// context if the command is denied, or `null` if it passes the allowlist.
+    /// This does NOT check risk-level gates (approval/blocking); use
+    /// `checkCommandExecution` for the full pipeline.
+    pub fn checkCommand(self: *const SecurityPolicy, command: []const u8) ?PolicyDenial {
+        if (self.autonomy == .read_only) {
+            const denial = PolicyDenial{
+                .reason = .read_only_mode,
+                .command = command,
+            };
+            self.emitDenial(denial);
+            return denial;
+        }
 
         // Reject oversized commands — never silently truncate
-        if (command.len > MAX_ANALYSIS_LEN) return false;
+        if (command.len > MAX_ANALYSIS_LEN) {
+            const denial = PolicyDenial{
+                .reason = .oversized_command,
+                .command = command[0..@min(command.len, 64)],
+            };
+            self.emitDenial(denial);
+            return denial;
+        }
 
         // Block subshell/expansion operators
-        if (containsStr(command, "`") or containsStr(command, "$(") or containsStr(command, "${")) {
-            return false;
+        if (containsStr(command, "`")) {
+            const denial = PolicyDenial{
+                .reason = .subshell_expansion,
+                .command = command,
+                .matched_rule = "`",
+            };
+            self.emitDenial(denial);
+            return denial;
+        }
+        if (containsStr(command, "$(")) {
+            const denial = PolicyDenial{
+                .reason = .subshell_expansion,
+                .command = command,
+                .matched_rule = "$(",
+            };
+            self.emitDenial(denial);
+            return denial;
+        }
+        if (containsStr(command, "${")) {
+            const denial = PolicyDenial{
+                .reason = .subshell_expansion,
+                .command = command,
+                .matched_rule = "${",
+            };
+            self.emitDenial(denial);
+            return denial;
         }
 
         // Block process substitution
-        if (containsStr(command, "<(") or containsStr(command, ">(")) {
-            return false;
+        if (containsStr(command, "<(")) {
+            const denial = PolicyDenial{
+                .reason = .process_substitution,
+                .command = command,
+                .matched_rule = "<(",
+            };
+            self.emitDenial(denial);
+            return denial;
+        }
+        if (containsStr(command, ">(")) {
+            const denial = PolicyDenial{
+                .reason = .process_substitution,
+                .command = command,
+                .matched_rule = ">(",
+            };
+            self.emitDenial(denial);
+            return denial;
         }
 
         // Block Windows %VAR% environment variable expansion (cmd.exe attack surface)
         if (comptime @import("builtin").os.tag == .windows) {
-            if (hasPercentVar(command)) return false;
+            if (hasPercentVar(command)) {
+                const denial = PolicyDenial{
+                    .reason = .windows_env_expansion,
+                    .command = command,
+                    .matched_rule = "%VAR%",
+                };
+                self.emitDenial(denial);
+                return denial;
+            }
         }
 
         // Block `tee` — can write to arbitrary files, bypassing redirect checks
@@ -176,16 +404,38 @@ pub const SecurityPolicy = struct {
             var words_iter = std.mem.tokenizeAny(u8, command, " \t\n;|");
             while (words_iter.next()) |word| {
                 if (std.mem.eql(u8, word, "tee") or std.mem.eql(u8, extractBasename(word), "tee")) {
-                    return false;
+                    const denial = PolicyDenial{
+                        .reason = .tee_blocked,
+                        .command = command,
+                        .matched_rule = "tee",
+                    };
+                    self.emitDenial(denial);
+                    return denial;
                 }
             }
         }
 
         // Block single & background chaining (&& is allowed)
-        if (containsSingleAmpersand(command)) return false;
+        if (containsSingleAmpersand(command)) {
+            const denial = PolicyDenial{
+                .reason = .background_chaining,
+                .command = command,
+                .matched_rule = "&",
+            };
+            self.emitDenial(denial);
+            return denial;
+        }
 
         // Block output redirections
-        if (std.mem.indexOfScalar(u8, command, '>') != null) return false;
+        if (std.mem.indexOfScalar(u8, command, '>') != null) {
+            const denial = PolicyDenial{
+                .reason = .output_redirection,
+                .command = command,
+                .matched_rule = ">",
+            };
+            self.emitDenial(denial);
+            return denial;
+        }
 
         var normalized: [MAX_ANALYSIS_LEN]u8 = undefined;
         const norm_len = normalizeCommand(command, &normalized);
@@ -214,13 +464,92 @@ pub const SecurityPolicy = struct {
                     break;
                 }
             }
-            if (!found) return false;
+            if (!found) {
+                const denial = PolicyDenial{
+                    .reason = .command_not_in_allowlist,
+                    .command = command,
+                    .matched_rule = base_cmd,
+                };
+                self.emitDenial(denial);
+                return denial;
+            }
 
             // Block dangerous arguments for specific commands
-            if (!isArgsSafe(base_cmd, cmd_part)) return false;
+            if (!isArgsSafe(base_cmd, cmd_part)) {
+                const denial = PolicyDenial{
+                    .reason = .dangerous_arguments,
+                    .command = command,
+                    .matched_rule = base_cmd,
+                };
+                self.emitDenial(denial);
+                return denial;
+            }
         }
 
-        return has_cmd;
+        if (!has_cmd) {
+            const denial = PolicyDenial{
+                .reason = .empty_command,
+                .command = command,
+            };
+            self.emitDenial(denial);
+            return denial;
+        }
+
+        return null; // allowed
+    }
+
+    /// Full structured validation pipeline — combines allowlist check,
+    /// risk classification, and approval gates. Returns the risk level
+    /// on success, or a `PolicyDenial` on denial.
+    pub fn checkCommandExecution(
+        self: *const SecurityPolicy,
+        command: []const u8,
+        approved: bool,
+    ) union(enum) { allowed: CommandRiskLevel, denied: PolicyDenial } {
+        // Allowlist check
+        if (self.checkCommand(command)) |denial| {
+            return .{ .denied = denial };
+        }
+
+        const risk = self.commandRiskLevel(command);
+
+        // Risk-level gates
+        if (risk == .high) {
+            if (self.block_high_risk_commands) {
+                const denial = PolicyDenial{
+                    .reason = .high_risk_blocked,
+                    .command = command,
+                    .risk_level = .high,
+                };
+                self.emitDenial(denial);
+                return .{ .denied = denial };
+            }
+            if (self.autonomy == .supervised and !approved) {
+                const denial = PolicyDenial{
+                    .reason = .approval_required,
+                    .command = command,
+                    .risk_level = .high,
+                };
+                self.emitDenial(denial);
+                return .{ .denied = denial };
+            }
+        }
+
+        if (risk == .medium and
+            self.autonomy == .supervised and
+            self.require_approval_for_medium_risk and
+            !approved)
+        {
+            const denial = PolicyDenial{
+                .reason = .approval_required,
+                .command = command,
+                .risk_level = .medium,
+            };
+            self.emitDenial(denial);
+            return .{ .denied = denial };
+        }
+
+        return .{ .allowed = risk };
     }
 
     /// Check if autonomy level permits any action at all
@@ -243,6 +572,13 @@ pub const SecurityPolicy = struct {
             return tracker.isLimited();
         }
         return false;
+    }
+
+    /// Fire-and-forget denial notification to the observability hook.
+    fn emitDenial(self: *const SecurityPolicy, denial: PolicyDenial) void {
+        if (self.deny_hook) |hook| {
+            hook(&denial);
+        }
     }
 };
 
@@ -1080,4 +1416,322 @@ test "command at MAX_ANALYSIS_LEN minus one is still analyzed" {
     @memset(buf[3..], 'A');
     try std.testing.expect(p.isCommandAllowed(&buf));
     try std.testing.expectEqual(CommandRiskLevel.low, p.commandRiskLevel(&buf));
+}
+
+// ── DenyReason tests ────────────────────────────────────────────
+
+test "DenyReason toString roundtrip" {
+    try std.testing.expectEqualStrings("read_only_mode", DenyReason.read_only_mode.toString());
+    try std.testing.expectEqualStrings("subshell_expansion", DenyReason.subshell_expansion.toString());
+    try std.testing.expectEqualStrings("approval_required", DenyReason.approval_required.toString());
+}
+
+test "DenyReason fromString roundtrip" {
+    try std.testing.expectEqual(DenyReason.read_only_mode, DenyReason.fromString("read_only_mode").?);
+    try std.testing.expectEqual(DenyReason.oversized_command, DenyReason.fromString("oversized_command").?);
+    try std.testing.expectEqual(DenyReason.tee_blocked, DenyReason.fromString("tee_blocked").?);
+    try std.testing.expectEqual(DenyReason.rate_limited, DenyReason.fromString("rate_limited").?);
+    try std.testing.expect(DenyReason.fromString("invalid") == null);
+    try std.testing.expect(DenyReason.fromString("") == null);
+}
+
+test "DenyReason toMessage returns human-readable text" {
+    const msg = DenyReason.read_only_mode.toMessage();
+    try std.testing.expect(msg.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "read-only") != null);
+
+    const msg2 = DenyReason.command_not_in_allowlist.toMessage();
+    try std.testing.expect(msg2.len > 0);
+}
+
+// ── checkCommand structured denial tests ────────────────────────
+
+test "checkCommand returns null for allowed commands" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(p.checkCommand("ls") == null);
+    try std.testing.expect(p.checkCommand("git status") == null);
+    try std.testing.expect(p.checkCommand("cat file.txt") == null);
+}
+
+test "checkCommand read_only returns denial with reason" {
+    const p = SecurityPolicy{ .autonomy = .read_only };
+    const denial = p.checkCommand("ls").?;
+    try std.testing.expectEqual(DenyReason.read_only_mode, denial.reason);
+    try std.testing.expectEqualStrings("ls", denial.command);
+}
+
+test "checkCommand subshell expansion returns denial with matched_rule" {
+    const p = SecurityPolicy{};
+    {
+        const denial = p.checkCommand("echo `whoami`").?;
+        try std.testing.expectEqual(DenyReason.subshell_expansion, denial.reason);
+        try std.testing.expectEqualStrings("`", denial.matched_rule.?);
+    }
+    {
+        const denial = p.checkCommand("echo $(cat /etc/passwd)").?;
+        try std.testing.expectEqual(DenyReason.subshell_expansion, denial.reason);
+        try std.testing.expectEqualStrings("$(", denial.matched_rule.?);
+    }
+    {
+        const denial = p.checkCommand("echo ${IFS}cat").?;
+        try std.testing.expectEqual(DenyReason.subshell_expansion, denial.reason);
+        try std.testing.expectEqualStrings("${", denial.matched_rule.?);
+    }
+}
+
+test "checkCommand process substitution returns denial" {
+    const p = SecurityPolicy{};
+    {
+        const denial = p.checkCommand("cat <(echo hello)").?;
+        try std.testing.expectEqual(DenyReason.process_substitution, denial.reason);
+        try std.testing.expectEqualStrings("<(", denial.matched_rule.?);
+    }
+    {
+        const denial = p.checkCommand("echo >(cat)").?;
+        try std.testing.expectEqual(DenyReason.process_substitution, denial.reason);
+        try std.testing.expectEqualStrings(">(", denial.matched_rule.?);
+    }
+}
+
+test "checkCommand tee blocked returns denial" {
+    const p = SecurityPolicy{};
+    const denial = p.checkCommand("echo hello | tee /tmp/out").?;
+    try std.testing.expectEqual(DenyReason.tee_blocked, denial.reason);
+    try std.testing.expectEqualStrings("tee", denial.matched_rule.?);
+}
+
+test "checkCommand background chaining returns denial" {
+    const p = SecurityPolicy{};
+    const denial = p.checkCommand("ls & echo done").?;
+    try std.testing.expectEqual(DenyReason.background_chaining, denial.reason);
+    try std.testing.expectEqualStrings("&", denial.matched_rule.?);
+}
+
+test "checkCommand output redirection returns denial" {
+    const p = SecurityPolicy{};
+    const denial = p.checkCommand("echo secret > /etc/crontab").?;
+    try std.testing.expectEqual(DenyReason.output_redirection, denial.reason);
+    try std.testing.expectEqualStrings(">", denial.matched_rule.?);
+}
+
+test "checkCommand not in allowlist returns denial with basename" {
+    const p = SecurityPolicy{};
+    const denial = p.checkCommand("python3 exploit.py").?;
+    try std.testing.expectEqual(DenyReason.command_not_in_allowlist, denial.reason);
+    try std.testing.expectEqualStrings("python3", denial.matched_rule.?);
+}
+
+test "checkCommand dangerous arguments returns denial" {
+    const p = SecurityPolicy{};
+    const denial = p.checkCommand("find . -exec rm -rf {} +").?;
+    try std.testing.expectEqual(DenyReason.dangerous_arguments, denial.reason);
+    try std.testing.expectEqualStrings("find", denial.matched_rule.?);
+}
+
+test "checkCommand empty command returns denial" {
+    const p = SecurityPolicy{};
+    {
+        const denial = p.checkCommand("").?;
+        try std.testing.expectEqual(DenyReason.empty_command, denial.reason);
+    }
+    {
+        const denial = p.checkCommand("   ").?;
+        try std.testing.expectEqual(DenyReason.empty_command, denial.reason);
+    }
+}
+
+test "checkCommand oversized command returns denial" {
+    const p = SecurityPolicy{};
+    var buf: [MAX_ANALYSIS_LEN + 1]u8 = undefined;
+    @memset(&buf, 'A');
+    const denial = p.checkCommand(&buf).?;
+    try std.testing.expectEqual(DenyReason.oversized_command, denial.reason);
+    // Command is truncated for the denial struct
+    try std.testing.expect(denial.command.len <= 64);
+}
+
+// ── checkCommandExecution structured tests ──────────────────────
+
+test "checkCommandExecution allowed returns risk level" {
+    const p = SecurityPolicy{};
+    const result = p.checkCommandExecution("ls -la", false);
+    switch (result) {
+        .allowed => |risk| try std.testing.expectEqual(CommandRiskLevel.low, risk),
+        .denied => return error.TestUnexpectedResult,
+    }
+}
+
+test "checkCommandExecution denied returns structured denial" {
+    const p = SecurityPolicy{};
+    const result = p.checkCommandExecution("python3 exploit.py", false);
+    switch (result) {
+        .allowed => return error.TestUnexpectedResult,
+        .denied => |denial| {
+            try std.testing.expectEqual(DenyReason.command_not_in_allowlist, denial.reason);
+            try std.testing.expectEqualStrings("python3", denial.matched_rule.?);
+        },
+    }
+}
+
+test "checkCommandExecution high risk blocked returns denial" {
+    const allowed = [_][]const u8{"rm"};
+    const p = SecurityPolicy{
+        .autonomy = .supervised,
+        .allowed_commands = &allowed,
+    };
+    const result = p.checkCommandExecution("rm -rf /tmp/test", true);
+    switch (result) {
+        .allowed => return error.TestUnexpectedResult,
+        .denied => |denial| {
+            try std.testing.expectEqual(DenyReason.high_risk_blocked, denial.reason);
+            try std.testing.expectEqual(CommandRiskLevel.high, denial.risk_level.?);
+        },
+    }
+}
+
+test "checkCommandExecution approval required returns denial" {
+    const allowed = [_][]const u8{"touch"};
+    const p = SecurityPolicy{
+        .autonomy = .supervised,
+        .require_approval_for_medium_risk = true,
+        .allowed_commands = &allowed,
+    };
+    const result = p.checkCommandExecution("touch test.txt", false);
+    switch (result) {
+        .allowed => return error.TestUnexpectedResult,
+        .denied => |denial| {
+            try std.testing.expectEqual(DenyReason.approval_required, denial.reason);
+            try std.testing.expectEqual(CommandRiskLevel.medium, denial.risk_level.?);
+        },
+    }
+}
+
+test "checkCommandExecution approved medium risk passes" {
+    const allowed = [_][]const u8{"touch"};
+    const p = SecurityPolicy{
+        .autonomy = .supervised,
+        .require_approval_for_medium_risk = true,
+        .allowed_commands = &allowed,
+    };
+    const result = p.checkCommandExecution("touch test.txt", true);
+    switch (result) {
+        .allowed => |risk| try std.testing.expectEqual(CommandRiskLevel.medium, risk),
+        .denied => return error.TestUnexpectedResult,
+    }
+}
+
+// ── PolicyDenial serialization tests ────────────────────────────
+
+test "PolicyDenial message delegates to DenyReason" {
+    const denial = PolicyDenial{
+        .reason = .tee_blocked,
+        .command = "tee outfile",
+        .matched_rule = "tee",
+    };
+    try std.testing.expectEqualStrings(DenyReason.tee_blocked.toMessage(), denial.message());
+}
+
+test "PolicyDenial formatJsonLine basic" {
+    const denial = PolicyDenial{
+        .reason = .read_only_mode,
+        .command = "ls",
+    };
+    var buf: [512]u8 = undefined;
+    const json = denial.formatJsonLine(&buf).?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"reason\":\"read_only_mode\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"message\":\"") != null);
+    // No matched_rule or risk_level fields when null
+    try std.testing.expect(std.mem.indexOf(u8, json, "matched_rule") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "risk_level") == null);
+}
+
+test "PolicyDenial formatJsonLine with all fields" {
+    const denial = PolicyDenial{
+        .reason = .high_risk_blocked,
+        .command = "rm -rf /",
+        .matched_rule = "rm",
+        .risk_level = .high,
+    };
+    var buf: [512]u8 = undefined;
+    const json = denial.formatJsonLine(&buf).?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"reason\":\"high_risk_blocked\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"matched_rule\":\"rm\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"risk_level\":\"high\"") != null);
+}
+
+test "PolicyDenial formatJsonLine returns null on tiny buffer" {
+    const denial = PolicyDenial{
+        .reason = .read_only_mode,
+        .command = "ls",
+    };
+    var buf: [5]u8 = undefined;
+    try std.testing.expect(denial.formatJsonLine(&buf) == null);
+}
+
+// ── Deny hook tests ─────────────────────────────────────────────
+
+var test_hook_called: bool = false;
+var test_hook_reason: ?DenyReason = null;
+
+fn testDenyHook(denial: *const PolicyDenial) void {
+    test_hook_called = true;
+    test_hook_reason = denial.reason;
+}
+
+test "deny hook is called on denial" {
+    test_hook_called = false;
+    test_hook_reason = null;
+    const p = SecurityPolicy{
+        .autonomy = .read_only,
+        .deny_hook = testDenyHook,
+    };
+    try std.testing.expect(!p.isCommandAllowed("ls"));
+    try std.testing.expect(test_hook_called);
+    try std.testing.expectEqual(DenyReason.read_only_mode, test_hook_reason.?);
+}
+
+test "deny hook not called when allowed" {
+    test_hook_called = false;
+    test_hook_reason = null;
+    const p = SecurityPolicy{
+        .deny_hook = testDenyHook,
+    };
+    try std.testing.expect(p.isCommandAllowed("ls"));
+    try std.testing.expect(!test_hook_called);
+}
+
+test "no deny hook means no crash" {
+    const p = SecurityPolicy{ .deny_hook = null };
+    // Should not crash even without a hook
+    try std.testing.expect(p.isCommandAllowed("ls"));
+    try std.testing.expect(!p.isCommandAllowed("python3 exploit.py"));
+}
+
+test "deny hook receives correct reason for each deny path" {
+    test_hook_called = false;
+    test_hook_reason = null;
+    const p = SecurityPolicy{
+        .deny_hook = testDenyHook,
+    };
+
+    // Test subshell expansion
+    _ = p.checkCommand("echo `whoami`");
+    try std.testing.expectEqual(DenyReason.subshell_expansion, test_hook_reason.?);
+
+    // Test not in allowlist
+    test_hook_reason = null;
+    _ = p.checkCommand("python3 exploit.py");
+    try std.testing.expectEqual(DenyReason.command_not_in_allowlist, test_hook_reason.?);
+
+    // Test empty command
+    test_hook_reason = null;
+    _ = p.checkCommand("");
+    try std.testing.expectEqual(DenyReason.empty_command, test_hook_reason.?);
+}
+
+// ── Default deny_hook is null ───────────────────────────────────
+
+test "default policy has null deny_hook" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(p.deny_hook == null);
 }
