@@ -14,7 +14,7 @@ const cron = @import("cron.zig");
 const bus_mod = @import("bus.zig");
 const dispatch = @import("channels/dispatch.zig");
 const channel_loop = @import("channel_loop.zig");
-const telegram = @import("channels/telegram.zig");
+const discord_mod = @import("channels/discord.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -118,8 +118,7 @@ pub fn computeBackoff(current_backoff: u64, max_backoff: u64) u64 {
 
 /// Check if any real-time channels are configured.
 pub fn hasSupervisedChannels(config: *const Config) bool {
-    return config.channels.telegram != null or
-        config.channels.discord != null or
+    return config.channels.discord != null or
         config.channels.slack != null or
         config.channels.imessage != null or
         config.channels.matrix != null or
@@ -202,10 +201,10 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
     }
 }
 
-/// Stale detection threshold: 3x the Telegram long-poll timeout (30s).
-const STALE_THRESHOLD_SECS: i64 = 90;
+/// Stale detection threshold for consumer activity (seconds).
+const STALE_THRESHOLD_SECS: i64 = 120;
 
-/// Channel supervisor thread — spawns polling threads for configured channels,
+/// Channel supervisor thread — creates Discord channel, bus, and consumer thread,
 /// monitors their health, and restarts on failure using SupervisedChannel.
 fn channelSupervisorThread(
     allocator: std.mem.Allocator,
@@ -217,60 +216,84 @@ fn channelSupervisorThread(
     state.markRunning("channels");
     health.markComponentOk("channels");
 
-    // ── Telegram supervision ──
-    var tg_loop_state: ?*channel_loop.TelegramLoopState = null;
-    var tg_health_channel: ?*telegram.TelegramChannel = null;
+    // ── Discord supervision ──
+    var discord_loop_state: ?*channel_loop.DiscordLoopState = null;
+    var discord_channel: ?*discord_mod.DiscordChannel = null;
+    var discord_bus: ?*bus_mod.Bus = null;
     var supervised: ?dispatch.SupervisedChannel = null;
 
-    if (config.channels.telegram) |tg_config| {
+    if (config.channels.discord) |dc_config| {
         if (channel_rt == null) {
             state.markError("channels", "runtime init failed");
             health.markComponentError("channels", "runtime init failed");
         }
         if (channel_rt) |rt| {
             // Heap-alloc loop state
-            const ls = allocator.create(channel_loop.TelegramLoopState) catch {
+            const ls = allocator.create(channel_loop.DiscordLoopState) catch {
                 state.markError("channels", "failed to alloc loop state");
                 health.markComponentError("channels", "alloc failed");
                 return;
             };
-            ls.* = channel_loop.TelegramLoopState.init();
-            tg_loop_state = ls;
+            ls.* = channel_loop.DiscordLoopState.init();
+            discord_loop_state = ls;
 
-            // Separate TelegramChannel for health-check probe (stateless HTTP GET)
-            const hc = allocator.create(telegram.TelegramChannel) catch {
-                state.markError("channels", "failed to alloc health channel");
+            // Heap-alloc Bus
+            const b = allocator.create(bus_mod.Bus) catch {
+                state.markError("channels", "failed to alloc bus");
                 return;
             };
-            hc.* = telegram.TelegramChannel.init(allocator, tg_config.bot_token, tg_config.allow_from);
-            hc.proxy = tg_config.proxy;
-            tg_health_channel = hc;
+            b.* = bus_mod.Bus.init();
+            discord_bus = b;
+
+            // Heap-alloc DiscordChannel
+            const ch = allocator.create(discord_mod.DiscordChannel) catch {
+                state.markError("channels", "failed to alloc discord channel");
+                return;
+            };
+            ch.* = discord_mod.DiscordChannel.init(allocator, dc_config.token, dc_config.guild_id, dc_config.allow_bots);
+            ch.bus = b;
+            ch.allow_from = dc_config.allow_from;
+            ch.mention_only = dc_config.mention_only;
+            ch.intents = dc_config.intents;
+            discord_channel = ch;
 
             // Register in channel registry for outbound dispatch
-            channel_registry.register(hc.channel()) catch |err| {
-                log.warn("Failed to register telegram in channel registry: {}", .{err});
+            channel_registry.register(ch.channel()) catch |err| {
+                log.warn("Failed to register discord in channel registry: {}", .{err});
             };
 
             // SupervisedChannel wrapper
-            supervised = dispatch.spawnSupervisedChannel(hc.channel(), 5);
+            supervised = dispatch.spawnSupervisedChannel(ch.channel(), 5);
 
-            // Spawn the polling thread
-            ls.thread = spawnTelegramThread(allocator, config, rt, ls);
-            if (ls.thread != null) {
+            // Start gateway + heartbeat threads
+            ch.channel().start() catch |err| {
+                log.err("Failed to start Discord gateway: {}", .{err});
+                state.markError("channels", "gateway start failed");
+                health.markComponentError("discord", "gateway start failed");
+            };
+
+            // Spawn consumer thread
+            ls.consumer_thread = spawnDiscordConsumerThread(allocator, config, rt, ls, ch, b);
+            if (ls.consumer_thread != null) {
                 if (supervised) |*s| s.recordSuccess();
-                log.info("Telegram polling thread started", .{});
+                log.info("Discord consumer thread started", .{});
             }
         }
     }
 
     defer {
-        // Shutdown: signal polling thread to stop and join
-        if (tg_loop_state) |ls| {
+        // Shutdown: signal consumer thread to stop, close bus, join, stop gateway
+        if (discord_loop_state) |ls| {
             ls.stop_requested.store(true, .release);
-            if (ls.thread) |t| t.join();
+            if (discord_bus) |b| b.close();
+            if (ls.consumer_thread) |t| t.join();
             allocator.destroy(ls);
         }
-        if (tg_health_channel) |hc| allocator.destroy(hc);
+        if (discord_channel) |ch| {
+            ch.channel().stop();
+            allocator.destroy(ch);
+        }
+        if (discord_bus) |b| allocator.destroy(b);
     }
 
     // ── Monitoring loop ──
@@ -278,77 +301,97 @@ fn channelSupervisorThread(
         std.Thread.sleep(CHANNEL_WATCH_INTERVAL_SECS * std.time.ns_per_s);
         if (isShutdownRequested()) break;
 
-        if (tg_loop_state) |ls| {
+        if (discord_loop_state) |ls| {
             const now = std.time.timestamp();
             const last = ls.last_activity.load(.acquire);
             const stale = (now - last) > STALE_THRESHOLD_SECS;
 
-            // Active HTTP health-check probe
-            const probe_ok = if (tg_health_channel) |hc| hc.healthCheck() else true;
+            // Check gateway health
+            const gateway_ok = if (discord_channel) |ch| ch.running.load(.acquire) else true;
 
-            if (!stale and probe_ok) {
-                health.markComponentOk("telegram");
+            if (!stale and gateway_ok) {
+                health.markComponentOk("discord");
                 state.markRunning("channels");
                 if (supervised) |*s| {
                     if (s.state != .running) s.recordSuccess();
                 }
             } else {
                 // Problem detected
-                const reason = if (stale) "polling thread stale" else "health check failed";
-                log.warn("Telegram issue: {s}", .{reason});
-                health.markComponentError("telegram", reason);
+                const reason = if (!gateway_ok) "gateway disconnected" else "consumer thread stale";
+                log.warn("Discord issue: {s}", .{reason});
+                health.markComponentError("discord", reason);
 
                 if (supervised) |*s| {
                     s.recordFailure();
 
                     if (s.shouldRestart()) {
-                        log.info("Restarting Telegram polling (attempt {d})", .{s.restart_count});
+                        log.info("Restarting Discord (attempt {d})", .{s.restart_count});
                         state.markError("channels", reason);
 
-                        // Stop old thread
+                        // Stop old consumer thread via bus close
                         ls.stop_requested.store(true, .release);
-                        if (ls.thread) |t| t.join();
+                        if (discord_bus) |b| b.close();
+                        if (ls.consumer_thread) |t| t.join();
+
+                        // Stop and restart gateway
+                        if (discord_channel) |ch| ch.channel().stop();
 
                         // Backoff sleep
                         std.Thread.sleep(s.currentBackoffMs() * std.time.ns_per_ms);
 
-                        // Respawn
+                        // Re-init bus
+                        if (discord_bus) |b| b.* = bus_mod.Bus.init();
+
+                        // Restart gateway
+                        if (discord_channel) |ch| {
+                            ch.channel().start() catch |err| {
+                                log.err("Failed to restart Discord gateway: {}", .{err});
+                            };
+                        }
+
+                        // Respawn consumer thread
                         ls.stop_requested.store(false, .release);
                         ls.last_activity.store(std.time.timestamp(), .release);
-                        if (channel_rt) |rt| {
-                            ls.thread = spawnTelegramThread(allocator, config, rt, ls);
-                            if (ls.thread != null) {
-                                s.recordSuccess();
-                                state.markRunning("channels");
-                                health.markComponentOk("telegram");
+                        if (channel_rt) |crt| {
+                            if (discord_channel) |ch| {
+                                if (discord_bus) |b| {
+                                    ls.consumer_thread = spawnDiscordConsumerThread(allocator, config, crt, ls, ch, b);
+                                    if (ls.consumer_thread != null) {
+                                        s.recordSuccess();
+                                        state.markRunning("channels");
+                                        health.markComponentOk("discord");
+                                    }
+                                }
                             }
                         }
                     } else if (s.state == .gave_up) {
                         state.markError("channels", "gave up after max restarts");
-                        health.markComponentError("telegram", "gave up after max restarts");
+                        health.markComponentError("discord", "gave up after max restarts");
                     }
                 }
             }
         } else {
-            // No telegram configured — just report ok
+            // No discord configured — just report ok
             health.markComponentOk("channels");
         }
     }
 }
 
-/// Spawn a Telegram polling thread.
-fn spawnTelegramThread(
+/// Spawn a Discord consumer thread.
+fn spawnDiscordConsumerThread(
     allocator: std.mem.Allocator,
     config: *const Config,
     runtime: *channel_loop.ChannelRuntime,
-    loop_state: *channel_loop.TelegramLoopState,
+    loop_state: *channel_loop.DiscordLoopState,
+    discord: *discord_mod.DiscordChannel,
+    bus: *bus_mod.Bus,
 ) ?std.Thread {
     return std.Thread.spawn(
         .{ .stack_size = 2 * 1024 * 1024 },
-        channel_loop.runTelegramLoop,
-        .{ allocator, config, runtime, loop_state },
+        channel_loop.runDiscordLoop,
+        .{ allocator, config, runtime, loop_state, discord, bus },
     ) catch |err| {
-        log.err("Failed to spawn Telegram thread: {}", .{err});
+        log.err("Failed to spawn Discord consumer thread: {}", .{err});
         return null;
     };
 }
@@ -583,7 +626,7 @@ test "channelSupervisorThread respects shutdown" {
     shutdown_requested.store(true, .release);
     defer shutdown_requested.store(false, .release);
 
-    // Config with no telegram → supervisor goes straight to idle loop → exits on shutdown
+    // Config with no discord → supervisor goes straight to idle loop → exits on shutdown
     const config = Config{
         .workspace_dir = "/tmp",
         .config_path = "/tmp/config.json",

@@ -217,8 +217,7 @@ pub fn checkConfigSemantics(
 
     // Channels: at least one configured
     const ch = &config.channels;
-    const has_channel = ch.telegram != null or
-        ch.discord != null or
+    const has_channel = ch.discord != null or
         ch.slack != null or
         ch.webhook != null or
         ch.imessage != null or
@@ -836,8 +835,6 @@ fn checkChannels(allocator: std.mem.Allocator, cfg: *const Config, items: *std.A
     const cat = "channels";
     items.append(allocator, DiagItem.ok(cat, "CLI always available")) catch {};
 
-    if (cfg.channels.telegram != null)
-        items.append(allocator, DiagItem.ok(cat, "Telegram configured")) catch {};
     if (cfg.channels.discord != null)
         items.append(allocator, DiagItem.ok(cat, "Discord configured")) catch {};
     if (cfg.channels.slack != null)
@@ -1045,7 +1042,7 @@ test "checkDaemonState parses valid JSON state" {
     defer std.testing.allocator.free(base);
 
     const state_content =
-        \\{"status": "running", "updated_at": 9999999999, "components": {"scheduler": {"status": "ok"}, "channel:telegram": {"status": "ok"}}}
+        \\{"status": "running", "updated_at": 9999999999, "components": {"scheduler": {"status": "ok"}, "channel:discord": {"status": "ok"}}}
     ;
     {
         const file = try tmp.dir.createFile("daemon_state.json", .{});

@@ -74,7 +74,6 @@ pub fn allIntegrations() []const IntegrationEntry {
 
 const all_integrations_list = [_]IntegrationEntry{
     // Chat Providers
-    .{ .name = "Telegram", .description = "Bot API -- long-polling", .category = .chat, .status = .available },
     .{ .name = "Discord", .description = "Servers, channels & DMs", .category = .chat, .status = .available },
     .{ .name = "Slack", .description = "Workspace apps via Web API", .category = .chat, .status = .available },
     .{ .name = "Webhooks", .description = "HTTP endpoint for triggers", .category = .chat, .status = .available },
@@ -155,8 +154,8 @@ const all_integrations_list = [_]IntegrationEntry{
     .{ .name = "macOS", .description = "Native support + AppleScript", .category = .platform, .status = .active },
     .{ .name = "Linux", .description = "Native support", .category = .platform, .status = .available },
     .{ .name = "Windows", .description = "WSL2 recommended", .category = .platform, .status = .available },
-    .{ .name = "iOS", .description = "Chat via Telegram/Discord", .category = .platform, .status = .available },
-    .{ .name = "Android", .description = "Chat via Telegram/Discord", .category = .platform, .status = .available },
+    .{ .name = "iOS", .description = "Chat via Discord", .category = .platform, .status = .available },
+    .{ .name = "Android", .description = "Chat via Discord", .category = .platform, .status = .available },
 };
 
 /// Look up an integration by name (case-insensitive).
@@ -227,17 +226,17 @@ test "category all includes every variant once" {
     try std.testing.expectEqual(@as(usize, 9), all.len);
 }
 
-test "findIntegration finds Telegram" {
-    const entry = findIntegration("Telegram");
+test "findIntegration finds Discord" {
+    const entry = findIntegration("Discord");
     try std.testing.expect(entry != null);
-    try std.testing.expectEqualStrings("Telegram", entry.?.name);
+    try std.testing.expectEqualStrings("Discord", entry.?.name);
     try std.testing.expectEqual(IntegrationCategory.chat, entry.?.category);
 }
 
 test "findIntegration is case-insensitive" {
-    const entry = findIntegration("telegram");
+    const entry = findIntegration("discord");
     try std.testing.expect(entry != null);
-    try std.testing.expectEqualStrings("Telegram", entry.?.name);
+    try std.testing.expectEqualStrings("Discord", entry.?.name);
 }
 
 test "findIntegration returns null for unknown" {

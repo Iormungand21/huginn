@@ -19,7 +19,6 @@ pub const AgentConfig = config_types.AgentConfig;
 pub const ModelRouteConfig = config_types.ModelRouteConfig;
 pub const HeartbeatConfig = config_types.HeartbeatConfig;
 pub const CronConfig = config_types.CronConfig;
-pub const TelegramConfig = config_types.TelegramConfig;
 pub const DiscordConfig = config_types.DiscordConfig;
 pub const SlackConfig = config_types.SlackConfig;
 pub const WebhookConfig = config_types.WebhookConfig;
@@ -1301,26 +1300,6 @@ test "tools.media.audio disabled" {
     try std.testing.expect(!cfg.audio_media.enabled);
     // defaults remain
     try std.testing.expectEqualStrings("groq", cfg.audio_media.provider);
-}
-
-test "parse telegram accounts" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "123:ABC", "allow_from": ["user1"], "reply_in_private": false, "proxy": "socks5://host:1080"}}}}}
-    ;
-    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
-    try cfg.parseJson(json);
-    try std.testing.expect(cfg.channels.telegram != null);
-    const tg = cfg.channels.telegram.?;
-    try std.testing.expectEqualStrings("123:ABC", tg.bot_token);
-    try std.testing.expectEqual(@as(usize, 1), tg.allow_from.len);
-    try std.testing.expectEqualStrings("user1", tg.allow_from[0]);
-    try std.testing.expect(!tg.reply_in_private);
-    try std.testing.expectEqualStrings("socks5://host:1080", tg.proxy.?);
-    allocator.free(tg.bot_token);
-    for (tg.allow_from) |u| allocator.free(u);
-    allocator.free(tg.allow_from);
-    allocator.free(tg.proxy.?);
 }
 
 test "parse discord accounts" {

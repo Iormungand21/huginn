@@ -142,15 +142,6 @@ pub const CronConfig = struct {
 
 // ── Channel configs ─────────────────────────────────────────────
 
-pub const TelegramConfig = struct {
-    bot_token: []const u8,
-    allow_from: []const []const u8 = &.{},
-    /// Use reply-to in private (1:1) chats. Groups always use reply-to.
-    reply_in_private: bool = true,
-    /// Optional SOCKS5/HTTP proxy URL for all Telegram API requests (e.g. "socks5://host:port").
-    proxy: ?[]const u8 = null,
-};
-
 pub const DiscordConfig = struct {
     token: []const u8,
     guild_id: ?[]const u8 = null,
@@ -231,7 +222,6 @@ pub const DingTalkConfig = struct {
 
 pub const ChannelsConfig = struct {
     cli: bool = true,
-    telegram: ?TelegramConfig = null,
     discord: ?DiscordConfig = null,
     slack: ?SlackConfig = null,
     webhook: ?WebhookConfig = null,
@@ -422,7 +412,7 @@ pub const SecurityConfig = struct {
     sandbox: SandboxConfig = .{},
     resources: ResourceLimitsConfig = .{},
     audit: AuditConfig = .{},
-    /// Discord/Telegram user ID of the bot owner. Only this user can use privileged tools.
+    /// Discord user ID of the bot owner. Only this user can use privileged tools.
     owner_id: []const u8 = "",
     /// Secret scoping configuration.
     secret_scope: SecretScopeConfig = .{},

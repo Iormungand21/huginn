@@ -668,7 +668,7 @@ test "LogObserver does not panic on events" {
         .{ .tool_call_start = .{ .tool = "shell" } },
         .{ .tool_call = .{ .tool = "shell", .duration_ms = 10, .success = false } },
         .{ .turn_complete = {} },
-        .{ .channel_message = .{ .channel = "telegram", .direction = "outbound" } },
+        .{ .channel_message = .{ .channel = "discord", .direction = "outbound" } },
         .{ .heartbeat_tick = {} },
         .{ .err = .{ .component = "provider", .message = "timeout" } },
     };

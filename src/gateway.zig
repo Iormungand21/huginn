@@ -6,7 +6,7 @@
 //!   - Body size limits (64KB max)
 //!   - Request timeouts (30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram
+//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
@@ -206,7 +206,6 @@ pub const GatewayState = struct {
     idempotency: IdempotencyStore,
     whatsapp_verify_token: []const u8,
     whatsapp_app_secret: []const u8,
-    telegram_bot_token: []const u8,
     pairing_guard: ?PairingGuard,
 
     pub fn init(allocator: std.mem.Allocator) GatewayState {
@@ -220,7 +219,6 @@ pub const GatewayState = struct {
             .idempotency = IdempotencyStore.init(300),
             .whatsapp_verify_token = verify_token,
             .whatsapp_app_secret = "",
-            .telegram_bot_token = "",
             .pairing_guard = null,
         };
     }
@@ -571,48 +569,8 @@ pub fn processIncomingMessage(allocator: std.mem.Allocator, message: []const u8)
     return try allocator.dupe(u8, "No response from agent");
 }
 
-/// Send a reply to a Telegram chat using the Bot API.
-pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, chat_id: i64, text: []const u8) !void {
-    // Build the curl command to call the Telegram API
-    const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{bot_token});
-    defer allocator.free(url);
-
-    // JSON-escape the text for the body
-    var body_buf: std.ArrayList(u8) = .empty;
-    defer body_buf.deinit(allocator);
-    const w = body_buf.writer(allocator);
-    try w.print("{{\"chat_id\":{d},\"text\":\"", .{chat_id});
-    for (text) |c| {
-        switch (c) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            else => try w.writeByte(c),
-        }
-    }
-    try w.writeAll("\"}");
-
-    const body = body_buf.items;
-
-    var curl_child = std.process.Child.init(
-        &[_][]const u8{
-            "curl", "-s",                             "-X", "POST",
-            "-H",   "Content-Type: application/json", "-d", body,
-            url,
-        },
-        allocator,
-    );
-    curl_child.stdout_behavior = .Pipe;
-    curl_child.stderr_behavior = .Pipe;
-
-    curl_child.spawn() catch return;
-    _ = curl_child.wait() catch {};
-}
-
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram
+/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp
 pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
     health.markComponentOk("gateway");
 
@@ -640,9 +598,6 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
             cfg.gateway.require_pairing,
             cfg.gateway.paired_tokens,
         );
-        if (cfg.channels.telegram) |tg_cfg| {
-            state.telegram_bot_token = tg_cfg.bot_token;
-        }
         if (cfg.channels.whatsapp) |wa_cfg| {
             state.whatsapp_verify_token = wa_cfg.verify_token;
             state.whatsapp_app_secret = wa_cfg.app_secret orelse "";
@@ -729,13 +684,12 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
         const target = parts.next() orelse continue;
 
         // Simple routing — extract base path (strip query string) and look up route
-        const Route = enum { health, ready, webhook, pair, telegram, whatsapp };
+        const Route = enum { health, ready, webhook, pair, whatsapp };
         const route_map = std.StaticStringMap(Route).initComptime(.{
             .{ "/health", .health },
             .{ "/ready", .ready },
             .{ "/webhook", .webhook },
             .{ "/pair", .pair },
-            .{ "/telegram", .telegram },
             .{ "/whatsapp", .whatsapp },
         });
         const base_path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
@@ -853,49 +807,6 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                     } else {
                         response_status = "500 Internal Server Error";
                         response_body = "{\"error\":\"pairing unavailable\"}";
-                    }
-                }
-            },
-            .telegram => {
-                if (!is_post) {
-                    response_status = "405 Method Not Allowed";
-                    response_body = "{\"error\":\"method not allowed\"}";
-                } else if (!state.rate_limiter.allowWebhook(state.allocator, "telegram")) {
-                    // POST /telegram — Telegram webhook mode
-                    response_status = "429 Too Many Requests";
-                    response_body = "{\"error\":\"rate limited\"}";
-                } else {
-                    const body = extractBody(raw);
-                    if (body) |b| {
-                        // Parse Telegram update: extract message text and chat_id
-                        const msg_text = jsonStringField(b, "text");
-                        const chat_id = jsonIntField(b, "chat_id");
-
-                        if (msg_text != null and chat_id != null) {
-                            // Process the message in-process
-                            if (session_mgr_opt) |*sm| {
-                                var kb: [64]u8 = undefined;
-                                const sk = std.fmt.bufPrint(&kb, "telegram:{d}", .{chat_id.?}) catch "telegram:0";
-                                const reply = sm.processMessage(sk, msg_text.?) catch null;
-                                if (reply) |r| {
-                                    defer allocator.free(r);
-                                    // Send reply back to Telegram
-                                    if (state.telegram_bot_token.len > 0) {
-                                        sendTelegramReply(req_allocator, state.telegram_bot_token, chat_id.?, r) catch {};
-                                    }
-                                    response_body = "{\"status\":\"ok\"}";
-                                } else {
-                                    response_body = "{\"status\":\"received\"}";
-                                }
-                            } else {
-                                response_body = "{\"status\":\"received\"}";
-                            }
-                        } else {
-                            // No message text — could be an update_id-only update, just ack
-                            response_body = "{\"status\":\"ok\"}";
-                        }
-                    } else {
-                        response_body = "{\"status\":\"received\"}";
                     }
                 }
             },
@@ -1394,12 +1305,6 @@ test "extractBody returns null for no body" {
 test "extractBody returns null for no separator" {
     const raw = "GET /health HTTP/1.1\r\nHost: localhost\r\n";
     try std.testing.expect(extractBody(raw) == null);
-}
-
-test "GatewayState init has empty telegram_bot_token" {
-    var state = GatewayState.init(std.testing.allocator);
-    defer state.deinit();
-    try std.testing.expectEqualStrings("", state.telegram_bot_token);
 }
 
 // ── asciiEqlIgnoreCase tests ─────────────────────────────────────

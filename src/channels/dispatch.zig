@@ -308,11 +308,11 @@ test "health report empty is not healthy" {
 
 test "build system prompt" {
     const allocator = std.testing.allocator;
-    const prompt = try buildSystemPrompt(allocator, "Be helpful.", "telegram", "nullclaw");
+    const prompt = try buildSystemPrompt(allocator, "Be helpful.", "discord", "nullclaw");
     defer allocator.free(prompt);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Be helpful.") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "nullclaw") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "telegram") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "discord") != null);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -363,16 +363,16 @@ test "DispatchStats init all zero" {
 test "dispatcher routes message to correct channel" {
     const allocator = std.testing.allocator;
 
-    var mock_tg = MockChannel{ .name_str = "telegram" };
+    var mock_dc = MockChannel{ .name_str = "discord" };
     var reg = ChannelRegistry.init(allocator);
     defer reg.deinit();
-    try reg.register(mock_tg.channel());
+    try reg.register(mock_dc.channel());
 
     var event_bus = bus.Bus.init();
     var stats = DispatchStats{};
 
     // Publish a message, then close bus so dispatcher exits
-    const msg = try bus.makeOutbound(allocator, "telegram", "chat1", "hello");
+    const msg = try bus.makeOutbound(allocator, "discord", "chat1", "hello");
     try event_bus.publishOutbound(msg);
     event_bus.close();
 
@@ -381,7 +381,7 @@ test "dispatcher routes message to correct channel" {
     try std.testing.expectEqual(@as(u64, 1), stats.getDispatched());
     try std.testing.expectEqual(@as(u64, 0), stats.getErrors());
     try std.testing.expectEqual(@as(u64, 0), stats.getChannelNotFound());
-    try std.testing.expectEqual(@as(u64, 1), mock_tg.sent_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), mock_dc.sent_count.load(.monotonic));
 }
 
 test "dispatcher increments channel_not_found for unknown channel" {
@@ -429,23 +429,23 @@ test "dispatcher increments errors on channel.send failure" {
 test "dispatcher handles multiple messages" {
     const allocator = std.testing.allocator;
 
-    var mock_tg = MockChannel{ .name_str = "telegram" };
     var mock_dc = MockChannel{ .name_str = "discord" };
+    var mock_sl = MockChannel{ .name_str = "slack" };
     var reg = ChannelRegistry.init(allocator);
     defer reg.deinit();
-    try reg.register(mock_tg.channel());
     try reg.register(mock_dc.channel());
+    try reg.register(mock_sl.channel());
 
     var event_bus = bus.Bus.init();
     var stats = DispatchStats{};
 
-    // 3 to telegram, 2 to discord
+    // 3 to discord, 2 to slack
     for (0..3) |_| {
-        const msg = try bus.makeOutbound(allocator, "telegram", "c1", "msg");
+        const msg = try bus.makeOutbound(allocator, "discord", "c1", "msg");
         try event_bus.publishOutbound(msg);
     }
     for (0..2) |_| {
-        const msg = try bus.makeOutbound(allocator, "discord", "c2", "msg");
+        const msg = try bus.makeOutbound(allocator, "slack", "c2", "msg");
         try event_bus.publishOutbound(msg);
     }
     event_bus.close();
@@ -453,14 +453,14 @@ test "dispatcher handles multiple messages" {
     runOutboundDispatcher(allocator, &event_bus, &reg, &stats);
 
     try std.testing.expectEqual(@as(u64, 5), stats.getDispatched());
-    try std.testing.expectEqual(@as(u64, 3), mock_tg.sent_count.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 2), mock_dc.sent_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 3), mock_dc.sent_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), mock_sl.sent_count.load(.monotonic));
 }
 
 test "dispatcher mixed: found, not_found, error" {
     const allocator = std.testing.allocator;
 
-    var mock_ok = MockChannel{ .name_str = "telegram" };
+    var mock_ok = MockChannel{ .name_str = "discord" };
     var mock_fail = MockChannel{ .name_str = "broken", .should_fail = true };
     var reg = ChannelRegistry.init(allocator);
     defer reg.deinit();
@@ -471,7 +471,7 @@ test "dispatcher mixed: found, not_found, error" {
     var stats = DispatchStats{};
 
     // 1 ok, 1 error, 1 not found
-    const m1 = try bus.makeOutbound(allocator, "telegram", "c1", "ok");
+    const m1 = try bus.makeOutbound(allocator, "discord", "c1", "ok");
     try event_bus.publishOutbound(m1);
     const m2 = try bus.makeOutbound(allocator, "broken", "c2", "fail");
     try event_bus.publishOutbound(m2);
@@ -506,10 +506,10 @@ test "dispatcher empty bus returns immediately" {
 test "dispatcher runs in a separate thread" {
     const allocator = std.testing.allocator;
 
-    var mock_tg = MockChannel{ .name_str = "telegram" };
+    var mock_dc = MockChannel{ .name_str = "discord" };
     var reg = ChannelRegistry.init(allocator);
     defer reg.deinit();
-    try reg.register(mock_tg.channel());
+    try reg.register(mock_dc.channel());
 
     var event_bus = bus.Bus.init();
     var stats = DispatchStats{};
@@ -520,7 +520,7 @@ test "dispatcher runs in a separate thread" {
     });
 
     // Publish from main thread
-    const msg = try bus.makeOutbound(allocator, "telegram", "c1", "threaded");
+    const msg = try bus.makeOutbound(allocator, "discord", "c1", "threaded");
     try event_bus.publishOutbound(msg);
 
     // Small delay then close bus to let dispatcher process
@@ -529,7 +529,7 @@ test "dispatcher runs in a separate thread" {
     thread.join();
 
     try std.testing.expectEqual(@as(u64, 1), stats.getDispatched());
-    try std.testing.expectEqual(@as(u64, 1), mock_tg.sent_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), mock_dc.sent_count.load(.monotonic));
 }
 
 test "dispatcher concurrent producers + single dispatcher" {
@@ -579,8 +579,8 @@ test "dispatcher concurrent producers + single dispatcher" {
 test "getEnabledChannelNames returns registered names" {
     const allocator = std.testing.allocator;
 
-    var mock1 = MockChannel{ .name_str = "telegram" };
-    var mock2 = MockChannel{ .name_str = "discord" };
+    var mock1 = MockChannel{ .name_str = "discord" };
+    var mock2 = MockChannel{ .name_str = "slack" };
     var reg = ChannelRegistry.init(allocator);
     defer reg.deinit();
     try reg.register(mock1.channel());
@@ -590,8 +590,8 @@ test "getEnabledChannelNames returns registered names" {
     defer allocator.free(names);
 
     try std.testing.expectEqual(@as(usize, 2), names.len);
-    try std.testing.expectEqualStrings("telegram", names[0]);
-    try std.testing.expectEqualStrings("discord", names[1]);
+    try std.testing.expectEqualStrings("discord", names[0]);
+    try std.testing.expectEqualStrings("slack", names[1]);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -670,8 +670,8 @@ test "supervised channel recordSuccess resets state" {
 test "startAllSupervised wraps channel array" {
     const allocator = std.testing.allocator;
 
-    var mock1 = MockChannel{ .name_str = "telegram" };
-    var mock2 = MockChannel{ .name_str = "discord" };
+    var mock1 = MockChannel{ .name_str = "discord" };
+    var mock2 = MockChannel{ .name_str = "slack" };
     const channels = [_]root.Channel{ mock1.channel(), mock2.channel() };
 
     const supervised = try startAllSupervised(allocator, &channels);
@@ -680,6 +680,6 @@ test "startAllSupervised wraps channel array" {
     try std.testing.expectEqual(@as(usize, 2), supervised.len);
     try std.testing.expectEqual(SupervisedChannel.State.idle, supervised[0].state);
     try std.testing.expectEqual(SupervisedChannel.State.idle, supervised[1].state);
-    try std.testing.expectEqualStrings("telegram", supervised[0].channel.name());
-    try std.testing.expectEqualStrings("discord", supervised[1].channel.name());
+    try std.testing.expectEqualStrings("discord", supervised[0].channel.name());
+    try std.testing.expectEqualStrings("slack", supervised[1].channel.name());
 }

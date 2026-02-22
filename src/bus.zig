@@ -13,7 +13,7 @@ const testing = std.testing;
 // ---------------------------------------------------------------------------
 
 pub const InboundMessage = struct {
-    channel: []const u8, // "telegram", "discord", "webhook", "system"
+    channel: []const u8, // "discord", "webhook", "system"
     sender_id: []const u8, // sender identifier
     chat_id: []const u8, // chat/room identifier
     content: []const u8, // message text
@@ -322,7 +322,7 @@ pub const Bus = struct {
 
 test "InboundMessage.deinit frees all fields" {
     const alloc = testing.allocator;
-    var msg = try makeInbound(alloc, "telegram", "user1", "chat42", "hello", "telegram:chat42");
+    var msg = try makeInbound(alloc, "discord", "user1", "chat42", "hello", "discord:chat42");
     msg.deinit(alloc);
 }
 
@@ -351,7 +351,7 @@ test "makeOutbound produces owned copies" {
     var src_content = try alloc.dupe(u8, "reply");
     defer alloc.free(src_content);
 
-    const msg = try makeOutbound(alloc, "telegram", "c1", src_content);
+    const msg = try makeOutbound(alloc, "discord", "c1", src_content);
     defer msg.deinit(alloc);
 
     src_content[0] = 'Z';
@@ -438,14 +438,14 @@ test "bus roundtrip inbound" {
     var bus = Bus.init();
     defer bus.close();
 
-    const msg = try makeInbound(alloc, "telegram", "user1", "chat1", "hi", "telegram:chat1");
+    const msg = try makeInbound(alloc, "discord", "user1", "chat1", "hi", "discord:chat1");
     try bus.publishInbound(msg);
     try testing.expectEqual(@as(usize, 1), bus.inboundDepth());
 
     var got = bus.consumeInbound().?;
     defer got.deinit(alloc);
     try testing.expectEqualStrings("hi", got.content);
-    try testing.expectEqualStrings("telegram:chat1", got.session_key);
+    try testing.expectEqualStrings("discord:chat1", got.session_key);
 }
 
 test "bus roundtrip outbound" {
@@ -627,11 +627,11 @@ test "InboundMessage with media and metadata" {
     const media_src = [_][]const u8{ "/tmp/photo.jpg", "/tmp/voice.ogg" };
     var msg = try makeInboundFull(
         alloc,
-        "telegram",
+        "discord",
         "user1",
         "chat1",
         "see photo",
-        "telegram:chat1",
+        "discord:chat1",
         &media_src,
         "{\"message_id\":123,\"is_group\":true}",
     );

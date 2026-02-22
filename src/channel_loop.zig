@@ -1,37 +1,37 @@
-//! Channel Loop — extracted polling loops for daemon-supervised channels.
+//! Channel Loop — extracted consumer loops for daemon-supervised channels.
 //!
 //! Contains `ChannelRuntime` (shared dependencies for message processing)
-//! and `runTelegramLoop` (the polling thread function spawned by the
+//! and `runDiscordLoop` (the consumer thread function spawned by the
 //! daemon supervisor).
 
 const std = @import("std");
 const Config = @import("config.zig").Config;
-const telegram = @import("channels/telegram.zig");
+const discord_mod = @import("channels/discord.zig");
+const bus_mod = @import("bus.zig");
 const session_mod = @import("session.zig");
 const providers = @import("providers/root.zig");
 const memory_mod = @import("memory/root.zig");
 const observability = @import("observability.zig");
 const tools_mod = @import("tools/root.zig");
 const mcp = @import("mcp.zig");
-const voice = @import("voice.zig");
 const health = @import("health.zig");
 const daemon = @import("daemon.zig");
 
 const log = std.log.scoped(.channel_loop);
 
 // ════════════════════════════════════════════════════════════════════════════
-// TelegramLoopState — shared state between supervisor and polling thread
+// DiscordLoopState — shared state between supervisor and consumer thread
 // ════════════════════════════════════════════════════════════════════════════
 
-pub const TelegramLoopState = struct {
-    /// Updated after each pollUpdates() — epoch seconds.
+pub const DiscordLoopState = struct {
+    /// Updated after each processed message — epoch seconds.
     last_activity: std.atomic.Value(i64),
-    /// Supervisor sets this to ask the polling thread to stop.
+    /// Supervisor sets this to ask the consumer thread to stop.
     stop_requested: std.atomic.Value(bool),
-    /// Thread handle for join().
-    thread: ?std.Thread = null,
+    /// Consumer thread handle for join().
+    consumer_thread: ?std.Thread = null,
 
-    pub fn init() TelegramLoopState {
+    pub fn init() DiscordLoopState {
         return .{
             .last_activity = std.atomic.Value(i64).init(std.time.timestamp()),
             .stop_requested = std.atomic.Value(bool).init(false),
@@ -43,7 +43,7 @@ pub const TelegramLoopState = struct {
 pub const ProviderHolder = providers.ProviderHolder;
 
 // ════════════════════════════════════════════════════════════════════════════
-// ChannelRuntime — container for polling-thread dependencies
+// ChannelRuntime — container for consumer-thread dependencies
 // ════════════════════════════════════════════════════════════════════════════
 
 pub const ChannelRuntime = struct {
@@ -128,112 +128,99 @@ pub const ChannelRuntime = struct {
 };
 
 // ════════════════════════════════════════════════════════════════════════════
-// runTelegramLoop — polling thread function
+// runDiscordLoop — consumer thread function
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Thread-entry function for the Telegram polling loop.
-/// Mirrors main.zig:793-866 but checks `loop_state.stop_requested` and
-/// `daemon.isShutdownRequested()` for graceful shutdown.
-pub fn runTelegramLoop(
+/// Extract message_id from bus message metadata JSON.
+fn extractMessageId(allocator: std.mem.Allocator, metadata_json: ?[]const u8) ?[]const u8 {
+    const md = metadata_json orelse return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, md, .{}) catch return null;
+    defer parsed.deinit();
+    const mid_val = parsed.value.object.get("message_id") orelse return null;
+    return switch (mid_val) {
+        .string => |s| if (s.len > 0) (allocator.dupe(u8, s) catch null) else null,
+        else => null,
+    };
+}
+
+/// Thread-entry function for the Discord consumer loop.
+/// Reads inbound messages from the bus, processes them through the session
+/// manager, and sends replies via the Discord REST API.
+/// Checks `loop_state.stop_requested` and `daemon.isShutdownRequested()`
+/// each iteration; exits when the bus is closed (consumeInbound returns null).
+pub fn runDiscordLoop(
     allocator: std.mem.Allocator,
     config: *const Config,
     runtime: *ChannelRuntime,
-    loop_state: *TelegramLoopState,
+    loop_state: *DiscordLoopState,
+    discord: *discord_mod.DiscordChannel,
+    bus: *bus_mod.Bus,
 ) void {
-    const telegram_config = config.channels.telegram orelse return;
-
-    // Heap-alloc TelegramChannel for vtable pointer stability
-    const tg_ptr = allocator.create(telegram.TelegramChannel) catch return;
-    defer allocator.destroy(tg_ptr);
-    tg_ptr.* = telegram.TelegramChannel.init(allocator, telegram_config.bot_token, telegram_config.allow_from);
-    tg_ptr.proxy = telegram_config.proxy;
-
-    // Set up transcription — key comes from providers.{audio_media.provider}
-    const trans = config.audio_media;
-    if (config.getProviderKey(trans.provider)) |key| {
-        const wt = allocator.create(voice.WhisperTranscriber) catch {
-            log.warn("Failed to allocate WhisperTranscriber", .{});
-            return;
-        };
-        wt.* = .{
-            .endpoint = voice.resolveTranscriptionEndpoint(trans.provider, trans.base_url),
-            .api_key = key,
-            .model = trans.model,
-            .language = trans.language,
-        };
-        tg_ptr.transcriber = wt.transcriber();
-    }
-
-    // Register bot commands and skip stale messages
-    tg_ptr.setMyCommands();
-    tg_ptr.dropPendingUpdates();
-
-    var typing = telegram.TypingIndicator.init(tg_ptr);
     var evict_counter: u32 = 0;
-
-    const model = config.default_model orelse "anthropic/claude-sonnet-4";
 
     // Update activity timestamp at start
     loop_state.last_activity.store(std.time.timestamp(), .release);
 
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
-        const messages = tg_ptr.pollUpdates(allocator) catch |err| {
-            log.warn("Telegram poll error: {}", .{err});
-            loop_state.last_activity.store(std.time.timestamp(), .release);
-            std.Thread.sleep(5 * std.time.ns_per_s);
+        const maybe_msg = bus.consumeInbound();
+        const msg = maybe_msg orelse break; // Bus closed — shutting down
+        defer msg.deinit(allocator);
+
+        // Update activity after each message
+        loop_state.last_activity.store(std.time.timestamp(), .release);
+
+        log.info("{s}: {s}", .{ msg.sender_id, msg.content });
+
+        // Extract message_id from metadata for reaction support
+        const message_id = extractMessageId(allocator, msg.metadata_json);
+        defer if (message_id) |mid| allocator.free(mid);
+
+        // Add eyes emoji reaction to indicate we're processing
+        if (message_id) |mid| {
+            discord.addReaction(msg.chat_id, mid, "%F0%9F%91%80");
+        }
+
+        const raw_reply = runtime.session_mgr.processMessageFrom(msg.session_key, msg.content, msg.sender_id) catch |err| {
+            log.err("Agent error: {}", .{err});
+            const err_msg: []const u8 = switch (err) {
+                error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
+                error.OutOfMemory => "Out of memory.",
+                else => "An error occurred. Try again.",
+            };
+            discord.sendMessage(msg.chat_id, err_msg) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
             continue;
         };
 
-        // Update activity after each poll (even if no messages)
-        loop_state.last_activity.store(std.time.timestamp(), .release);
-
-        for (messages) |msg| {
-            // Handle /start command
-            const trimmed = std.mem.trim(u8, msg.content, " \t\r\n");
-            if (std.mem.eql(u8, trimmed, "/start")) {
-                var greeting_buf: [512]u8 = undefined;
-                const name = msg.first_name orelse msg.id;
-                const greeting = std.fmt.bufPrint(&greeting_buf, "Hello, {s}! I'm nullClaw.\n\nModel: {s}\nType /help for available commands.", .{ name, model }) catch "Hello! I'm nullClaw. Type /help for commands.";
-                tg_ptr.sendMessageWithReply(msg.sender, greeting, msg.message_id) catch |err| log.err("failed to send /start reply: {}", .{err});
-                continue;
+        // Check for conversation mode markers and strip them
+        var reply: []const u8 = raw_reply;
+        var reply_is_owned = false;
+        if (std.mem.indexOf(u8, raw_reply, "[CONV_MODE:on]")) |pos| {
+            discord.setConversationMode(msg.chat_id);
+            const stripped = std.fmt.allocPrint(allocator, "{s}{s}", .{ raw_reply[0..pos], raw_reply[pos + "[CONV_MODE:on]".len ..] }) catch null;
+            if (stripped) |s| {
+                reply = s;
+                reply_is_owned = true;
             }
-
-            // Reply-to logic
-            const use_reply_to = msg.is_group or telegram_config.reply_in_private;
-            const reply_to_id: ?i64 = if (use_reply_to) msg.message_id else null;
-
-            // Session key
-            var key_buf: [128]u8 = undefined;
-            const session_key = std.fmt.bufPrint(&key_buf, "telegram:{s}", .{msg.sender}) catch msg.sender;
-
-            // Typing indicator
-            typing.start(msg.sender);
-
-            const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
-                typing.stop();
-                log.err("Agent error: {}", .{err});
-                const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
-                    error.OutOfMemory => "Out of memory.",
-                    else => "An error occurred. Try again or /new for a fresh session.",
-                };
-                tg_ptr.sendMessageWithReply(msg.sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
-                continue;
-            };
-            defer allocator.free(reply);
-
-            typing.stop();
-
-            tg_ptr.sendMessageWithReply(msg.sender, reply, reply_to_id) catch |err| {
-                log.warn("Send error: {}", .{err});
-            };
+        } else if (std.mem.indexOf(u8, raw_reply, "[CONV_MODE:off]")) |pos| {
+            discord.clearConversationMode(msg.chat_id);
+            const stripped = std.fmt.allocPrint(allocator, "{s}{s}", .{ raw_reply[0..pos], raw_reply[pos + "[CONV_MODE:off]".len ..] }) catch null;
+            if (stripped) |s| {
+                reply = s;
+                reply_is_owned = true;
+            }
+        }
+        defer {
+            if (reply_is_owned) allocator.free(reply);
+            allocator.free(raw_reply);
         }
 
-        if (messages.len > 0) {
-            for (messages) |msg| {
-                msg.deinit(allocator);
-            }
-            allocator.free(messages);
+        // Trim whitespace from stripped reply
+        const trimmed_reply = std.mem.trim(u8, reply, " \t\r\n");
+
+        if (trimmed_reply.len > 0) {
+            discord.sendMessage(msg.chat_id, trimmed_reply) catch |err| {
+                log.warn("Send error: {}", .{err});
+            };
         }
 
         // Periodic session eviction
@@ -243,7 +230,7 @@ pub fn runTelegramLoop(
             _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
         }
 
-        health.markComponentOk("telegram");
+        health.markComponentOk("discord");
     }
 }
 
@@ -251,27 +238,47 @@ pub fn runTelegramLoop(
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
 
-test "TelegramLoopState init defaults" {
-    const state = TelegramLoopState.init();
+test "DiscordLoopState init defaults" {
+    const state = DiscordLoopState.init();
     try std.testing.expect(!state.stop_requested.load(.acquire));
-    try std.testing.expect(state.thread == null);
+    try std.testing.expect(state.consumer_thread == null);
     try std.testing.expect(state.last_activity.load(.acquire) > 0);
 }
 
-test "TelegramLoopState stop_requested toggle" {
-    var state = TelegramLoopState.init();
+test "DiscordLoopState stop_requested toggle" {
+    var state = DiscordLoopState.init();
     try std.testing.expect(!state.stop_requested.load(.acquire));
     state.stop_requested.store(true, .release);
     try std.testing.expect(state.stop_requested.load(.acquire));
 }
 
-test "TelegramLoopState last_activity update" {
-    var state = TelegramLoopState.init();
+test "DiscordLoopState last_activity update" {
+    var state = DiscordLoopState.init();
     const before = state.last_activity.load(.acquire);
     std.Thread.sleep(10 * std.time.ns_per_ms);
     state.last_activity.store(std.time.timestamp(), .release);
     const after = state.last_activity.load(.acquire);
     try std.testing.expect(after >= before);
+}
+
+test "extractMessageId from valid metadata" {
+    const alloc = std.testing.allocator;
+    const mid = extractMessageId(alloc, "{\"message_id\":\"12345\"}");
+    try std.testing.expect(mid != null);
+    try std.testing.expectEqualStrings("12345", mid.?);
+    alloc.free(mid.?);
+}
+
+test "extractMessageId returns null for missing metadata" {
+    try std.testing.expect(extractMessageId(std.testing.allocator, null) == null);
+}
+
+test "extractMessageId returns null for empty message_id" {
+    try std.testing.expect(extractMessageId(std.testing.allocator, "{\"message_id\":\"\"}") == null);
+}
+
+test "extractMessageId returns null for invalid JSON" {
+    try std.testing.expect(extractMessageId(std.testing.allocator, "not json") == null);
 }
 
 test "ProviderHolder tagged union fields" {

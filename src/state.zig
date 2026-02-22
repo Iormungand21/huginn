@@ -196,9 +196,9 @@ test "StateManager setLastChannel and getLastChannel" {
     try testing.expect(before.channel == null);
     try testing.expect(before.chat_id == null);
 
-    mgr.setLastChannel("telegram", "chat_42");
+    mgr.setLastChannel("discord", "chat_42");
     const after = mgr.getLastChannel();
-    try testing.expectEqualStrings("telegram", after.channel.?);
+    try testing.expectEqualStrings("discord", after.channel.?);
     try testing.expectEqualStrings("chat_42", after.chat_id.?);
 }
 
@@ -206,11 +206,11 @@ test "StateManager setLastChannel overwrites previous" {
     var mgr = try StateManager.init(testing.allocator, "/tmp/test-state.json");
     defer mgr.deinit();
 
-    mgr.setLastChannel("telegram", "c1");
-    mgr.setLastChannel("discord", "c2");
+    mgr.setLastChannel("discord", "c1");
+    mgr.setLastChannel("slack", "c2");
 
     const last = mgr.getLastChannel();
-    try testing.expectEqualStrings("discord", last.channel.?);
+    try testing.expectEqualStrings("slack", last.channel.?);
     try testing.expectEqualStrings("c2", last.chat_id.?);
 }
 
@@ -235,7 +235,7 @@ test "StateManager save and load roundtrip" {
     {
         var mgr = try StateManager.init(testing.allocator, path);
         defer mgr.deinit();
-        mgr.setLastChannel("telegram", "chat_99");
+        mgr.setLastChannel("discord", "chat_99");
         try mgr.save();
     }
 
@@ -245,7 +245,7 @@ test "StateManager save and load roundtrip" {
         defer mgr.deinit();
         try mgr.load();
         const last = mgr.getLastChannel();
-        try testing.expectEqualStrings("telegram", last.channel.?);
+        try testing.expectEqualStrings("discord", last.channel.?);
         try testing.expectEqualStrings("chat_99", last.chat_id.?);
         try testing.expect(mgr.getUpdatedAt() > 0);
     }
@@ -300,16 +300,16 @@ test "StateManager save overwrites previous file" {
     var mgr = try StateManager.init(testing.allocator, path);
     defer mgr.deinit();
 
-    mgr.setLastChannel("telegram", "c1");
+    mgr.setLastChannel("discord", "c1");
     try mgr.save();
-    mgr.setLastChannel("discord", "c2");
+    mgr.setLastChannel("slack", "c2");
     try mgr.save();
 
     // Reload — should have latest
     var mgr2 = try StateManager.init(testing.allocator, path);
     defer mgr2.deinit();
     try mgr2.load();
-    try testing.expectEqualStrings("discord", mgr2.getLastChannel().channel.?);
+    try testing.expectEqualStrings("slack", mgr2.getLastChannel().channel.?);
     try testing.expectEqualStrings("c2", mgr2.getLastChannel().chat_id.?);
 }
 

@@ -808,30 +808,6 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 }
             }.call;
 
-            // Telegram
-            if (ch.object.get("telegram")) |tg| {
-                if (tg == .object) {
-                    if (getFirstAccount(tg.object)) |acc| {
-                        if (acc.get("bot_token")) |tok| {
-                            if (tok == .string) {
-                                self.channels.telegram = .{ .bot_token = try self.allocator.dupe(u8, tok.string) };
-                            }
-                        }
-                        if (self.channels.telegram) |*tg_cfg| {
-                            if (acc.get("allow_from")) |v| {
-                                if (v == .array) tg_cfg.allow_from = try parseStringArray(self.allocator, v.array);
-                            }
-                            if (acc.get("reply_in_private")) |v| {
-                                if (v == .bool) tg_cfg.reply_in_private = v.bool;
-                            }
-                            if (acc.get("proxy")) |v| {
-                                if (v == .string) tg_cfg.proxy = try self.allocator.dupe(u8, v.string);
-                            }
-                        }
-                    }
-                }
-            }
-
             // Discord
             if (ch.object.get("discord")) |disc| {
                 if (disc == .object) {

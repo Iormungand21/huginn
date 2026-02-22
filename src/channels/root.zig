@@ -3,7 +3,6 @@
 //!
 //! Channels (matching ZeroClaw):
 //!   - CLI (built-in stdin/stdout)
-//!   - Telegram (long-polling)
 //!   - Discord (WebSocket gateway)
 //!   - Slack (polling conversations.history)
 //!   - WhatsApp (webhook-based)
@@ -27,9 +26,9 @@ pub const ChannelMessage = struct {
     content: []const u8,
     channel: []const u8,
     timestamp: u64,
-    /// Where to send a reply (e.g., DM sender vs channel name in IRC, thread ID in Telegram).
+    /// Where to send a reply (e.g., DM sender vs channel name in IRC, thread ID in Discord).
     reply_target: ?[]const u8 = null,
-    /// Platform message ID (e.g. Telegram message_id for reply-to).
+    /// Platform message ID (e.g. Discord message_id for reply-to).
     message_id: ?i64 = null,
     /// Sender's first name (for personalized greetings).
     first_name: ?[]const u8 = null,
@@ -59,7 +58,7 @@ pub const Channel = struct {
         stop: *const fn (ptr: *anyopaque) void,
         /// Send a message to a target (user, channel, room, etc.).
         send: *const fn (ptr: *anyopaque, target: []const u8, message: []const u8) anyerror!void,
-        /// Return the channel name (e.g. "telegram", "discord").
+        /// Return the channel name (e.g. "discord", "slack").
         name: *const fn (ptr: *anyopaque) []const u8,
         /// Health check — return true if the channel is operational.
         healthCheck: *const fn (ptr: *anyopaque) bool,
@@ -91,7 +90,6 @@ pub const Channel = struct {
 // ════════════════════════════════════════════════════════════════════════════
 
 pub const cli = @import("cli.zig");
-pub const telegram = @import("telegram.zig");
 pub const discord = @import("discord.zig");
 pub const slack = @import("slack.zig");
 pub const whatsapp = @import("whatsapp.zig");

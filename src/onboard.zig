@@ -516,7 +516,6 @@ pub fn runChannelsOnly(allocator: std.mem.Allocator) !void {
     defer cfg.deinit();
 
     try stdout.print("  CLI:       {s}\n", .{if (cfg.channels.cli) "enabled" else "disabled"});
-    try stdout.print("  Telegram:  {s}\n", .{if (cfg.channels.telegram != null) "configured" else "not configured"});
     try stdout.print("  Discord:   {s}\n", .{if (cfg.channels.discord != null) "configured" else "not configured"});
     try stdout.print("  Slack:     {s}\n", .{if (cfg.channels.slack != null) "configured" else "not configured"});
     try stdout.print("  Webhook:   {s}\n", .{if (cfg.channels.webhook != null) "configured" else "not configured"});
