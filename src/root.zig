@@ -30,6 +30,7 @@ pub const migration = @import("migration.zig");
 pub const agent = @import("agent.zig");
 pub const session = @import("session.zig");
 pub const tasks = @import("tasks.zig");
+pub const orchestrator = @import("orchestrator.zig");
 pub const providers = @import("providers/root.zig");
 pub const memory = @import("memory/root.zig");
 
