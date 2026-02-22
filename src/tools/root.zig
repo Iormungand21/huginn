@@ -83,6 +83,7 @@ pub const i2c = @import("i2c.zig");
 pub const spi = @import("spi.zig");
 pub const path_security = @import("path_security.zig");
 pub const process_util = @import("process_util.zig");
+pub const reliability = @import("reliability.zig");
 
 // ── Core types ──────────────────────────────────────────────────────
 
