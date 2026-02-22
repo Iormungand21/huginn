@@ -468,6 +468,26 @@ pub const McpServerConfig = struct {
     };
 };
 
+// ── Doctor config ───────────────────────────────────────────────
+
+pub const DoctorProfile = enum {
+    full,
+    software_only,
+
+    pub fn fromString(s: []const u8) ?DoctorProfile {
+        if (std.mem.eql(u8, s, "full")) return .full;
+        if (std.mem.eql(u8, s, "software_only")) return .software_only;
+        if (std.mem.eql(u8, s, "software-only")) return .software_only;
+        return null;
+    }
+};
+
+pub const DoctorConfig = struct {
+    /// Controls which diagnostic categories are shown.
+    /// `software_only` suppresses hardware/peripheral warnings.
+    profile: DoctorProfile = .software_only,
+};
+
 // ── Model Pricing ──────────────────────────────────────────────
 
 pub const ModelPricing = struct {

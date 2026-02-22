@@ -55,6 +55,8 @@ pub const ModelPricing = config_types.ModelPricing;
 pub const ToolsConfig = config_types.ToolsConfig;
 pub const ProviderEntry = config_types.ProviderEntry;
 pub const AudioMediaConfig = config_types.AudioMediaConfig;
+pub const DoctorProfile = config_types.DoctorProfile;
+pub const DoctorConfig = config_types.DoctorConfig;
 
 // ── Top-level Config ────────────────────────────────────────────
 
@@ -98,6 +100,7 @@ pub const Config = struct {
     peripherals: PeripheralsConfig = .{},
     hardware: HardwareConfig = .{},
     security: SecurityConfig = .{},
+    doctor: DoctorConfig = .{},
     tools: ToolsConfig = .{},
 
     // Convenience aliases for backward-compat flat access used by other modules.

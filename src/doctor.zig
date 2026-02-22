@@ -13,6 +13,7 @@ const builtin = @import("builtin");
 const platform = @import("platform.zig");
 const Config = @import("config.zig").Config;
 const cfg_types = @import("config.zig");
+const DoctorProfile = cfg_types.DoctorProfile;
 const daemon = @import("daemon.zig");
 const cron = @import("cron.zig");
 const sandbox_detect = @import("security/detect.zig");
@@ -73,6 +74,8 @@ pub fn runDoctor(
     var items: std.ArrayList(DiagItem) = .empty;
     defer items.deinit(allocator);
 
+    const profile = config.doctor.profile;
+
     // Core checks (matching ZeroClaw)
     try checkConfigSemantics(allocator, config, &items);
     try checkWorkspace(allocator, config, &items);
@@ -81,12 +84,20 @@ pub fn runDoctor(
 
     // nullclaw-specific extras
     checkSandbox(allocator, config, &items);
-    try checkHardwareReadiness(allocator, config, &items);
+    if (profile == .full) {
+        try checkHardwareReadiness(allocator, config, &items);
+    } else {
+        try items.append(allocator, DiagItem.ok("hardware", "skipped (software_only profile)"));
+    }
     try checkCronStatus(allocator, &items);
     checkChannels(allocator, config, &items);
 
     // Print grouped report
-    try writer.writeAll("nullclaw Doctor (enhanced)\n\n");
+    const profile_label: []const u8 = switch (profile) {
+        .full => "full",
+        .software_only => "software_only",
+    };
+    try writer.print("nullclaw Doctor (profile: {s})\n\n", .{profile_label});
 
     var current_cat: []const u8 = "";
     var ok_count: u32 = 0;
@@ -565,14 +576,14 @@ fn checkSandbox(allocator: std.mem.Allocator, cfg: *const Config, items: *std.Ar
     }
 
     const configured_backend = sandboxBackendName(cfg.security.sandbox.backend);
-    items.append(allocator, DiagItem.ok(cat, std.fmt.allocPrint(
+    items.append(allocator, DiagItem.ok(cat, (std.fmt.allocPrint(
         allocator,
         "sandbox: enabled (configured: {s})",
         .{configured_backend},
-    ) catch "sandbox: enabled") catch {};
+    ) catch "sandbox: enabled"))) catch {};
 
     const avail = sandbox_detect.detectAvailable(allocator, cfg.workspace_dir);
-    items.append(allocator, DiagItem.ok(cat, std.fmt.allocPrint(
+    items.append(allocator, DiagItem.ok(cat, (std.fmt.allocPrint(
         allocator,
         "available backends: landlock={s}, firejail={s}, bubblewrap={s}, docker={s}",
         .{
@@ -581,7 +592,7 @@ fn checkSandbox(allocator: std.mem.Allocator, cfg: *const Config, items: *std.Ar
             boolWord(avail.bubblewrap),
             boolWord(avail.docker),
         },
-    ) catch "available backends: unknown") catch {};
+    ) catch "available backends: unknown"))) catch {};
 
     var storage: sandbox_detect.SandboxStorage = .{};
     const selected = sandbox_detect.createSandbox(
@@ -591,17 +602,17 @@ fn checkSandbox(allocator: std.mem.Allocator, cfg: *const Config, items: *std.Ar
         &storage,
     );
     if (cfg.security.sandbox.backend != .auto and !std.mem.eql(u8, selected.name(), configured_backend)) {
-        items.append(allocator, DiagItem.warn(cat, std.fmt.allocPrint(
+        items.append(allocator, DiagItem.warn(cat, (std.fmt.allocPrint(
             allocator,
             "requested backend '{s}' unavailable; using '{s}'",
             .{ configured_backend, selected.name() },
-        ) catch "requested backend unavailable")) catch {};
+        ) catch "requested backend unavailable"))) catch {};
     } else {
-        items.append(allocator, DiagItem.ok(cat, std.fmt.allocPrint(
+        items.append(allocator, DiagItem.ok(cat, (std.fmt.allocPrint(
             allocator,
             "selected backend: {s}",
             .{selected.name()},
-        ) catch "selected backend: unknown")) catch {};
+        ) catch "selected backend: unknown"))) catch {};
     }
 }
 
@@ -1072,6 +1083,55 @@ test "DiagResult defaults" {
     const result = DiagResult{ .name = "test", .ok = true, .message = "all good" };
     try std.testing.expectEqualStrings("test", result.name);
     try std.testing.expect(result.ok);
+}
+
+test "software_only profile skips hardware checks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var buf: [8192]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const writer = fbs.writer();
+
+    var cfg = testConfig();
+    cfg.doctor.profile = .software_only;
+    try runDoctor(allocator, &cfg, writer);
+
+    const output = fbs.getWritten();
+    // Header should mention software_only profile
+    try std.testing.expect(std.mem.indexOf(u8, output, "software_only") != null);
+    // Should contain the skipped note
+    try std.testing.expect(std.mem.indexOf(u8, output, "skipped (software_only profile)") != null);
+}
+
+test "full profile header shown" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var buf: [8192]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const writer = fbs.writer();
+
+    var cfg = testConfig();
+    cfg.doctor.profile = .full;
+    try runDoctor(allocator, &cfg, writer);
+
+    const output = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, output, "profile: full") != null);
+}
+
+test "DoctorProfile.fromString parses valid values" {
+    try std.testing.expectEqual(DoctorProfile.full, DoctorProfile.fromString("full").?);
+    try std.testing.expectEqual(DoctorProfile.software_only, DoctorProfile.fromString("software_only").?);
+    try std.testing.expectEqual(DoctorProfile.software_only, DoctorProfile.fromString("software-only").?);
+    try std.testing.expectEqual(@as(?DoctorProfile, null), DoctorProfile.fromString("bogus"));
+}
+
+test "default doctor profile is software_only" {
+    const cfg = testConfig();
+    try std.testing.expectEqual(DoctorProfile.software_only, cfg.doctor.profile);
 }
 
 test "doctor module compiles" {}

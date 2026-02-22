@@ -739,6 +739,19 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
+    // Doctor
+    if (root.get("doctor")) |doc| {
+        if (doc == .object) {
+            if (doc.object.get("profile")) |v| {
+                if (v == .string) {
+                    if (types.DoctorProfile.fromString(v.string)) |p| {
+                        self.doctor.profile = p;
+                    }
+                }
+            }
+        }
+    }
+
     // Tunnel
     if (root.get("tunnel")) |tun| {
         if (tun == .object) {
