@@ -10,6 +10,7 @@
 
 pub const types = @import("types.zig");
 pub const protocol = @import("protocol.zig");
+pub const conflict = @import("conflict.zig");
 
 // Re-export core types for convenient access
 pub const SCHEMA_VERSION = types.SCHEMA_VERSION;
@@ -32,7 +33,16 @@ pub const memoryMessage = protocol.memoryMessage;
 pub const taskMessage = protocol.taskMessage;
 pub const eventMessage = protocol.eventMessage;
 
+// Re-export conflict resolution types
+pub const ConflictRecord = conflict.ConflictRecord;
+pub const ConflictOutcome = conflict.ConflictOutcome;
+pub const ResolutionPolicy = conflict.ResolutionPolicy;
+pub const Side = conflict.Side;
+pub const resolve = conflict.resolve;
+pub const resolveWith = conflict.resolveWith;
+
 test {
     _ = types;
     _ = protocol;
+    _ = conflict;
 }
