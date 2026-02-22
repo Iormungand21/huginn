@@ -402,7 +402,7 @@ test "queue fill to capacity" {
 test "queue close wakes consumer — returns null" {
     var q = BoundedQueue(u32, 4).init();
 
-    const handle = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+    const handle = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, struct {
         fn run(qp: *BoundedQueue(u32, 4)) void {
             std.Thread.sleep(5 * std.time.ns_per_ms);
             qp.close();
@@ -494,7 +494,7 @@ test "bus multiple inbound producers" {
 
     var handles: [num_threads]std.Thread = undefined;
     for (0..num_threads) |t| {
-        handles[t] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+        handles[t] = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, struct {
             fn run(b: *Bus, tid: usize, a: Allocator) void {
                 for (0..msgs_per_thread) |i| {
                     var id_buf: [32]u8 = undefined;
@@ -533,7 +533,7 @@ test "bus stress: 10 producers × 100 messages" {
 
     var producers: [num_threads]std.Thread = undefined;
     for (0..num_threads) |t| {
-        producers[t] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+        producers[t] = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, struct {
             fn run(b: *Bus, tid: usize, a: Allocator) void {
                 for (0..msgs_per_thread) |i| {
                     var id_buf: [32]u8 = undefined;
@@ -546,7 +546,7 @@ test "bus stress: 10 producers × 100 messages" {
     }
 
     var count: usize = 0;
-    const consumer = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+    const consumer = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, struct {
         fn run(b: *Bus, cnt: *usize, a: Allocator) void {
             while (b.consumeInbound()) |msg| {
                 msg.deinit(a);
@@ -696,7 +696,7 @@ test "bus outbound multiple producers" {
 
     var handles: [num_threads]std.Thread = undefined;
     for (0..num_threads) |t| {
-        handles[t] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+        handles[t] = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, struct {
             fn run(b: *Bus, tid: usize, a: Allocator) void {
                 for (0..msgs_per_thread) |i| {
                     var id_buf: [32]u8 = undefined;
