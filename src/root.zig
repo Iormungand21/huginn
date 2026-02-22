@@ -61,7 +61,10 @@ pub const subagent = @import("subagent.zig");
 // Phase 4c: Auth
 pub const auth = @import("auth.zig");
 
-// Phase 5: Hardware & Integrations
+// Phase 5: Sync
+pub const sync = @import("sync/root.zig");
+
+// Phase 6: Hardware & Integrations
 pub const hardware = @import("hardware.zig");
 pub const integrations = @import("integrations.zig");
 pub const peripherals = @import("peripherals.zig");
