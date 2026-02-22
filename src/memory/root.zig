@@ -19,6 +19,7 @@ pub const embeddings = @import("embeddings.zig");
 pub const vector = @import("vector.zig");
 pub const hygiene = @import("hygiene.zig");
 pub const snapshot = @import("snapshot.zig");
+pub const hub_snapshot = @import("hub_snapshot.zig");
 pub const types = @import("types.zig");
 pub const decay = @import("decay.zig");
 
@@ -38,6 +39,13 @@ pub const HygieneReport = hygiene.HygieneReport;
 pub const exportSnapshot = snapshot.exportSnapshot;
 pub const hydrateFromSnapshot = snapshot.hydrateFromSnapshot;
 pub const shouldHydrate = snapshot.shouldHydrate;
+pub const HubSnapshot = hub_snapshot.HubSnapshot;
+pub const HubSnapshotMeta = hub_snapshot.HubSnapshotMeta;
+pub const HubSnapshotEntry = hub_snapshot.HubSnapshotEntry;
+pub const exportHubSnapshot = hub_snapshot.exportHubSnapshot;
+pub const importHubSnapshot = hub_snapshot.importHubSnapshot;
+pub const serializeSnapshot = hub_snapshot.serializeSnapshot;
+pub const ImportResult = hub_snapshot.ImportResult;
 pub const MemoryKind = types.MemoryKind;
 pub const MemoryTier = types.MemoryTier;
 pub const SourceMeta = types.SourceMeta;
@@ -455,6 +463,7 @@ test {
     _ = vector;
     _ = hygiene;
     _ = snapshot;
+    _ = hub_snapshot;
     _ = types;
     _ = decay;
 }
