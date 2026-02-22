@@ -9,10 +9,13 @@
 //!   - Sandbox, cron status, channel connectivity (nullclaw-specific)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const platform = @import("platform.zig");
 const Config = @import("config.zig").Config;
+const cfg_types = @import("config.zig");
 const daemon = @import("daemon.zig");
 const cron = @import("cron.zig");
+const sandbox_detect = @import("security/detect.zig");
 
 /// Staleness thresholds (seconds).
 const DAEMON_STALE_SECONDS: i64 = 30;
@@ -78,6 +81,7 @@ pub fn runDoctor(
 
     // nullclaw-specific extras
     checkSandbox(allocator, config, &items);
+    try checkHardwareReadiness(allocator, config, &items);
     try checkCronStatus(allocator, &items);
     checkChannels(allocator, config, &items);
 
@@ -560,7 +564,229 @@ fn checkSandbox(allocator: std.mem.Allocator, cfg: *const Config, items: *std.Ar
         return;
     }
 
-    items.append(allocator, DiagItem.ok(cat, "sandbox: enabled")) catch {};
+    const configured_backend = sandboxBackendName(cfg.security.sandbox.backend);
+    items.append(allocator, DiagItem.ok(cat, std.fmt.allocPrint(
+        allocator,
+        "sandbox: enabled (configured: {s})",
+        .{configured_backend},
+    ) catch "sandbox: enabled") catch {};
+
+    const avail = sandbox_detect.detectAvailable(allocator, cfg.workspace_dir);
+    items.append(allocator, DiagItem.ok(cat, std.fmt.allocPrint(
+        allocator,
+        "available backends: landlock={s}, firejail={s}, bubblewrap={s}, docker={s}",
+        .{
+            boolWord(avail.landlock),
+            boolWord(avail.firejail),
+            boolWord(avail.bubblewrap),
+            boolWord(avail.docker),
+        },
+    ) catch "available backends: unknown") catch {};
+
+    var storage: sandbox_detect.SandboxStorage = .{};
+    const selected = sandbox_detect.createSandbox(
+        allocator,
+        mapSandboxBackend(cfg.security.sandbox.backend),
+        cfg.workspace_dir,
+        &storage,
+    );
+    if (cfg.security.sandbox.backend != .auto and !std.mem.eql(u8, selected.name(), configured_backend)) {
+        items.append(allocator, DiagItem.warn(cat, std.fmt.allocPrint(
+            allocator,
+            "requested backend '{s}' unavailable; using '{s}'",
+            .{ configured_backend, selected.name() },
+        ) catch "requested backend unavailable")) catch {};
+    } else {
+        items.append(allocator, DiagItem.ok(cat, std.fmt.allocPrint(
+            allocator,
+            "selected backend: {s}",
+            .{selected.name()},
+        ) catch "selected backend: unknown")) catch {};
+    }
+}
+
+fn checkHardwareReadiness(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    items: *std.ArrayList(DiagItem),
+) !void {
+    const cat = "hardware";
+    const hardware_requested = cfg.hardware.enabled or
+        cfg.peripherals.enabled or
+        cfg.hardware.transport != .none or
+        cfg.peripherals.boards.len > 0;
+
+    if (!hardware_requested) {
+        try items.append(allocator, DiagItem.ok(cat, "hardware features disabled in config"));
+        return;
+    }
+
+    if (comptime builtin.os.tag != .linux) {
+        try items.append(allocator, DiagItem.warn(cat, "hardware checks are Linux-only; skipped on this OS"));
+        return;
+    }
+
+    // GPIO readiness: prefer gpiochip (libgpiod path), fall back to sysfs.
+    if (pathExists("/dev/gpiochip0")) {
+        try items.append(allocator, DiagItem.ok(cat, "GPIO chip device found: /dev/gpiochip0"));
+    } else if (pathExists("/sys/class/gpio")) {
+        try items.append(allocator, DiagItem.warn(cat, "only legacy sysfs GPIO detected (/sys/class/gpio)"));
+    } else {
+        try items.append(allocator, DiagItem.warn(cat, "no GPIO interface detected"));
+    }
+
+    if (commandRuns(allocator, &.{ "gpioget", "--help" }) and commandRuns(allocator, &.{ "gpioset", "--help" })) {
+        try items.append(allocator, DiagItem.ok(cat, "libgpiod CLI tools available (gpioget/gpioset)"));
+    } else {
+        try items.append(allocator, DiagItem.warn(cat, "libgpiod CLI tools missing (install: gpiod)"));
+    }
+
+    const i2c_count = countDevEntriesWithPrefix("i2c-");
+    if (i2c_count > 0) {
+        try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
+            allocator,
+            "I2C buses detected: {d}",
+            .{i2c_count},
+        )));
+    } else {
+        try items.append(allocator, DiagItem.warn(cat, "no /dev/i2c-* buses detected (enable I2C in raspi-config)"));
+    }
+
+    const spi_count = countDevEntriesWithPrefix("spidev");
+    if (spi_count > 0) {
+        try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
+            allocator,
+            "SPI devices detected: {d}",
+            .{spi_count},
+        )));
+    } else {
+        try items.append(allocator, DiagItem.warn(cat, "no /dev/spidev* devices detected (enable SPI in raspi-config)"));
+    }
+
+    if (cfg.hardware.transport == .serial) {
+        if (cfg.hardware.serial_port) |serial_port| {
+            if (pathExists(serial_port)) {
+                try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
+                    allocator,
+                    "serial device exists: {s}",
+                    .{serial_port},
+                )));
+            } else {
+                try items.append(allocator, DiagItem.warn(cat, try std.fmt.allocPrint(
+                    allocator,
+                    "serial device missing: {s}",
+                    .{serial_port},
+                )));
+            }
+        } else {
+            try items.append(allocator, DiagItem.warn(cat, "hardware transport is serial but no serial_port configured"));
+        }
+    }
+
+    if (try getCurrentUserGroups(allocator)) |groups| {
+        defer allocator.free(groups);
+        const missing = countMissingRequiredGroups(groups);
+        if (missing == 0) {
+            try items.append(allocator, DiagItem.ok(cat, "user groups include gpio/i2c/spi/dialout"));
+        } else {
+            try items.append(allocator, DiagItem.warn(cat, try std.fmt.allocPrint(
+                allocator,
+                "user is missing {d} hardware groups (expected: gpio i2c spi dialout)",
+                .{missing},
+            )));
+        }
+    } else {
+        try items.append(allocator, DiagItem.warn(cat, "could not inspect user groups (id -nG failed)"));
+    }
+}
+
+fn boolWord(v: bool) []const u8 {
+    return if (v) "yes" else "no";
+}
+
+fn sandboxBackendName(backend: cfg_types.SandboxBackend) []const u8 {
+    return @tagName(backend);
+}
+
+fn mapSandboxBackend(backend: cfg_types.SandboxBackend) sandbox_detect.SandboxBackend {
+    return switch (backend) {
+        .auto => .auto,
+        .landlock => .landlock,
+        .firejail => .firejail,
+        .bubblewrap => .bubblewrap,
+        .docker => .docker,
+        .none => .none,
+    };
+}
+
+fn pathExists(path: []const u8) bool {
+    std.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
+}
+
+fn commandRuns(allocator: std.mem.Allocator, argv: []const []const u8) bool {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+        .max_output_bytes = 1024,
+    }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+}
+
+fn countDevEntriesWithPrefix(prefix: []const u8) usize {
+    var dev_dir = std.fs.openDirAbsolute("/dev", .{ .iterate = true }) catch return 0;
+    defer dev_dir.close();
+
+    var it = dev_dir.iterate();
+    var count: usize = 0;
+    while (it.next() catch null) |entry| {
+        if (std.mem.startsWith(u8, entry.name, prefix)) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+fn getCurrentUserGroups(allocator: std.mem.Allocator) !?[]u8 {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "id", "-nG" },
+        .max_output_bytes = 1024,
+    }) catch return null;
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .Exited => |code| if (code != 0) {
+            allocator.free(result.stdout);
+            return null;
+        },
+        else => {
+            allocator.free(result.stdout);
+            return null;
+        },
+    }
+    return result.stdout;
+}
+
+fn countMissingRequiredGroups(group_output: []const u8) usize {
+    const required = [_][]const u8{ "gpio", "i2c", "spi", "dialout" };
+    var missing: usize = 0;
+    for (required) |name| {
+        if (!containsToken(group_output, name)) missing += 1;
+    }
+    return missing;
+}
+
+fn containsToken(haystack: []const u8, needle: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, haystack, " \t\r\n");
+    while (it.next()) |tok| {
+        if (std.mem.eql(u8, tok, needle)) return true;
+    }
+    return false;
 }
 
 /// Check cron scheduler status.
@@ -747,6 +973,16 @@ test "truncateForDisplay no-op when short enough" {
     const same = try truncateForDisplay(allocator, "hi", 10);
     defer allocator.free(same);
     try std.testing.expectEqualStrings("hi", same);
+}
+
+test "containsToken matches whole token only" {
+    try std.testing.expect(containsToken("gpio i2c spi dialout", "gpio"));
+    try std.testing.expect(!containsToken("audiogpio i2c", "gpio"));
+}
+
+test "countMissingRequiredGroups computes expected missing count" {
+    try std.testing.expectEqual(@as(usize, 0), countMissingRequiredGroups("gpio i2c spi dialout"));
+    try std.testing.expectEqual(@as(usize, 2), countMissingRequiredGroups("gpio dialout"));
 }
 
 test "checkEnvironment finds existing commands" {
