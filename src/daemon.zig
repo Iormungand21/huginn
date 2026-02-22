@@ -344,7 +344,7 @@ fn spawnTelegramThread(
     loop_state: *channel_loop.TelegramLoopState,
 ) ?std.Thread {
     return std.Thread.spawn(
-        .{ .stack_size = 512 * 1024 },
+        .{ .stack_size = 2 * 1024 * 1024 },
         channel_loop.runTelegramLoop,
         .{ allocator, config, runtime, loop_state },
     ) catch |err| {
@@ -398,7 +398,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     // Spawn gateway thread
     state.markRunning("gateway");
-    const gw_thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, gatewayThread, .{ allocator, host, port, &state }) catch |err| {
+    const gw_thread = std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, gatewayThread, .{ allocator, host, port, &state }) catch |err| {
         state.markError("gateway", @errorName(err));
         try stdout.print("Failed to spawn gateway: {}\n", .{err});
         return err;
@@ -408,7 +408,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var hb_thread: ?std.Thread = null;
     if (config.heartbeat.enabled) {
         state.markRunning("heartbeat");
-        if (std.Thread.spawn(.{ .stack_size = 128 * 1024 }, heartbeatThread, .{ allocator, config, &state })) |thread| {
+        if (std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, heartbeatThread, .{ allocator, config, &state })) |thread| {
             hb_thread = thread;
         } else |err| {
             state.markError("heartbeat", @errorName(err));
@@ -423,7 +423,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var sched_thread: ?std.Thread = null;
     if (config.scheduler.enabled) {
         state.markRunning("scheduler");
-        if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, schedulerThread, .{ allocator, config, &state, &event_bus })) |thread| {
+        if (std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, schedulerThread, .{ allocator, config, &state, &event_bus })) |thread| {
             sched_thread = thread;
         } else |err| {
             state.markError("scheduler", @errorName(err));
@@ -449,7 +449,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     // Spawn channel supervisor thread (only if channels are configured)
     var chan_thread: ?std.Thread = null;
     if (hasSupervisedChannels(config)) {
-        if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, channelSupervisorThread, .{
+        if (std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, channelSupervisorThread, .{
             allocator, config, &state, &channel_registry, channel_rt,
         })) |thread| {
             chan_thread = thread;
@@ -596,7 +596,7 @@ test "channelSupervisorThread respects shutdown" {
     var channel_registry = dispatch.ChannelRegistry.init(std.testing.allocator);
     defer channel_registry.deinit();
 
-    const thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, channelSupervisorThread, .{
+    const thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, channelSupervisorThread, .{
         std.testing.allocator, &config, &state, &channel_registry, null,
     });
     thread.join();
