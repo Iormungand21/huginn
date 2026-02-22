@@ -88,6 +88,9 @@ pub const Peripheral = struct {
 const allowed_serial_prefixes = [_][]const u8{
     "/dev/ttyACM",
     "/dev/ttyUSB",
+    "/dev/ttyAMA",
+    "/dev/ttyS",
+    "/dev/serial",
     "/dev/tty.usbmodem",
     "/dev/cu.usbmodem",
     "/dev/tty.usbserial",
@@ -492,11 +495,19 @@ pub const ArduinoPeripheral = struct {
 
 // ── RpiGpioPeripheral ───────────────────────────────────────────
 
-/// Raspberry Pi GPIO peripheral using sysfs interface.
-/// Uses /sys/class/gpio/export, direction, value for pin access.
+/// Raspberry Pi GPIO peripheral.
+/// Prefer libgpiod tools (`gpioget`/`gpioset`) on modern kernels and
+/// fall back to legacy sysfs when needed.
 pub const RpiGpioPeripheral = struct {
     connected: bool = false,
     exported_pins: [64]bool = [_]bool{false} ** 64,
+    backend: Backend = .none,
+
+    const Backend = enum {
+        none,
+        gpiod_cli,
+        sysfs,
+    };
 
     const rpi_vtable = Peripheral.VTable{
         .name = rpiName,
@@ -541,13 +552,22 @@ pub const RpiGpioPeripheral = struct {
         if (comptime builtin.os.tag != .linux) {
             return Peripheral.PeripheralError.UnsupportedOperation;
         }
-        // Check that /sys/class/gpio exists (Linux sysfs GPIO interface)
+        // Preferred path on modern Pi kernels.
+        if (isGpiodAvailable()) {
+            self.connected = true;
+            self.backend = .gpiod_cli;
+            return;
+        }
+
+        // Fallback path for older kernels/userspaces.
         var gpio_dir = std.fs.openDirAbsolute("/sys/class/gpio", .{}) catch {
             self.connected = false;
+            self.backend = .none;
             return Peripheral.PeripheralError.DeviceNotFound;
         };
         gpio_dir.close();
         self.connected = true;
+        self.backend = .sysfs;
     }
 
     fn rpiRead(ptr: *anyopaque, addr: u32) Peripheral.PeripheralError!u8 {
@@ -555,24 +575,34 @@ pub const RpiGpioPeripheral = struct {
         if (!self.connected) return Peripheral.PeripheralError.NotConnected;
         if (addr >= 64) return Peripheral.PeripheralError.InvalidAddress;
 
-        if (comptime builtin.os.tag == .linux) {
-            // 1. Export pin (ignore error if already exported)
-            rpiExportPin(addr);
-            // 2. Set direction to "in"
-            var dir_path_buf: [64]u8 = undefined;
-            const dir_path = std.fmt.bufPrint(&dir_path_buf, "/sys/class/gpio/gpio{d}/direction", .{addr}) catch
-                return Peripheral.PeripheralError.IoError;
-            rpiWriteFile(dir_path, "in") catch return Peripheral.PeripheralError.IoError;
-            // 3. Read value from /sys/class/gpio/gpioN/value
-            var val_path_buf: [64]u8 = undefined;
-            const val_path = std.fmt.bufPrint(&val_path_buf, "/sys/class/gpio/gpio{d}/value", .{addr}) catch
-                return Peripheral.PeripheralError.IoError;
-            const val = rpiReadFile(val_path) catch return Peripheral.PeripheralError.IoError;
-            self.exported_pins[addr] = true;
-            return val;
-        } else {
+        if (comptime builtin.os.tag != .linux) {
             return Peripheral.PeripheralError.UnsupportedOperation;
         }
+
+        return switch (self.backend) {
+            .gpiod_cli => {
+                const val = rpiReadViaGpiod(addr) catch return Peripheral.PeripheralError.IoError;
+                self.exported_pins[addr] = true;
+                return val;
+            },
+            .sysfs => {
+                // 1. Export pin (ignore error if already exported)
+                rpiExportPin(addr);
+                // 2. Set direction to "in"
+                var dir_path_buf: [64]u8 = undefined;
+                const dir_path = std.fmt.bufPrint(&dir_path_buf, "/sys/class/gpio/gpio{d}/direction", .{addr}) catch
+                    return Peripheral.PeripheralError.IoError;
+                rpiWriteFile(dir_path, "in") catch return Peripheral.PeripheralError.IoError;
+                // 3. Read value from /sys/class/gpio/gpioN/value
+                var val_path_buf: [64]u8 = undefined;
+                const val_path = std.fmt.bufPrint(&val_path_buf, "/sys/class/gpio/gpio{d}/value", .{addr}) catch
+                    return Peripheral.PeripheralError.IoError;
+                const val = rpiReadFile(val_path) catch return Peripheral.PeripheralError.IoError;
+                self.exported_pins[addr] = true;
+                return val;
+            },
+            .none => return Peripheral.PeripheralError.NotConnected,
+        };
     }
 
     fn rpiWrite(ptr: *anyopaque, addr: u32, data: u8) Peripheral.PeripheralError!void {
@@ -580,24 +610,105 @@ pub const RpiGpioPeripheral = struct {
         if (!self.connected) return Peripheral.PeripheralError.NotConnected;
         if (addr >= 64) return Peripheral.PeripheralError.InvalidAddress;
 
-        if (comptime builtin.os.tag == .linux) {
-            // 1. Export pin (ignore error if already exported)
-            rpiExportPin(addr);
-            // 2. Set direction to "out"
-            var dir_path_buf: [64]u8 = undefined;
-            const dir_path = std.fmt.bufPrint(&dir_path_buf, "/sys/class/gpio/gpio{d}/direction", .{addr}) catch
-                return Peripheral.PeripheralError.IoError;
-            rpiWriteFile(dir_path, "out") catch return Peripheral.PeripheralError.IoError;
-            // 3. Write value to /sys/class/gpio/gpioN/value
-            var val_path_buf: [64]u8 = undefined;
-            const val_path = std.fmt.bufPrint(&val_path_buf, "/sys/class/gpio/gpio{d}/value", .{addr}) catch
-                return Peripheral.PeripheralError.IoError;
-            const val_str: []const u8 = if (data != 0) "1" else "0";
-            rpiWriteFile(val_path, val_str) catch return Peripheral.PeripheralError.IoError;
-            self.exported_pins[addr] = true;
-        } else {
+        if (comptime builtin.os.tag != .linux) {
             return Peripheral.PeripheralError.UnsupportedOperation;
         }
+
+        switch (self.backend) {
+            .gpiod_cli => {
+                rpiWriteViaGpiod(addr, data) catch return Peripheral.PeripheralError.IoError;
+                self.exported_pins[addr] = true;
+            },
+            .sysfs => {
+                // 1. Export pin (ignore error if already exported)
+                rpiExportPin(addr);
+                // 2. Set direction to "out"
+                var dir_path_buf: [64]u8 = undefined;
+                const dir_path = std.fmt.bufPrint(&dir_path_buf, "/sys/class/gpio/gpio{d}/direction", .{addr}) catch
+                    return Peripheral.PeripheralError.IoError;
+                rpiWriteFile(dir_path, "out") catch return Peripheral.PeripheralError.IoError;
+                // 3. Write value to /sys/class/gpio/gpioN/value
+                var val_path_buf: [64]u8 = undefined;
+                const val_path = std.fmt.bufPrint(&val_path_buf, "/sys/class/gpio/gpio{d}/value", .{addr}) catch
+                    return Peripheral.PeripheralError.IoError;
+                const val_str: []const u8 = if (data != 0) "1" else "0";
+                rpiWriteFile(val_path, val_str) catch return Peripheral.PeripheralError.IoError;
+                self.exported_pins[addr] = true;
+            },
+            .none => return Peripheral.PeripheralError.NotConnected,
+        }
+    }
+
+    fn isGpiodAvailable() bool {
+        std.fs.accessAbsolute("/dev/gpiochip0", .{}) catch return false;
+
+        return commandSucceeds(&.{ "gpioget", "--help" }) and commandSucceeds(&.{ "gpioset", "--help" });
+    }
+
+    fn commandSucceeds(argv: []const []const u8) bool {
+        const result = std.process.Child.run(.{
+            .allocator = std.heap.page_allocator,
+            .argv = argv,
+            .max_output_bytes = 1024,
+        }) catch return false;
+        defer std.heap.page_allocator.free(result.stdout);
+        defer std.heap.page_allocator.free(result.stderr);
+        return switch (result.term) {
+            .Exited => |code| code == 0,
+            else => false,
+        };
+    }
+
+    fn rpiReadViaGpiod(pin: u32) !u8 {
+        var pin_buf: [8]u8 = undefined;
+        const pin_str = std.fmt.bufPrint(&pin_buf, "{d}", .{pin}) catch return error.IoError;
+
+        const result = std.process.Child.run(.{
+            .allocator = std.heap.page_allocator,
+            .argv = &.{ "gpioget", "gpiochip0", pin_str },
+            .max_output_bytes = 1024,
+        }) catch return error.IoError;
+        defer std.heap.page_allocator.free(result.stdout);
+        defer std.heap.page_allocator.free(result.stderr);
+
+        switch (result.term) {
+            .Exited => |code| if (code != 0) return error.IoError,
+            else => return error.IoError,
+        }
+        return parseGpiodValue(result.stdout) orelse return error.IoError;
+    }
+
+    fn rpiWriteViaGpiod(pin: u32, value: u8) !void {
+        var assignment_buf: [16]u8 = undefined;
+        const assignment = std.fmt.bufPrint(&assignment_buf, "{d}={d}", .{ pin, if (value != 0) 1 else 0 }) catch
+            return error.IoError;
+
+        const result = std.process.Child.run(.{
+            .allocator = std.heap.page_allocator,
+            .argv = &.{ "gpioset", "--mode=exit", "gpiochip0", assignment },
+            .max_output_bytes = 1024,
+        }) catch return error.IoError;
+        defer std.heap.page_allocator.free(result.stdout);
+        defer std.heap.page_allocator.free(result.stderr);
+
+        switch (result.term) {
+            .Exited => |code| if (code != 0) return error.IoError,
+            else => return error.IoError,
+        }
+    }
+
+    fn parseGpiodValue(stdout: []const u8) ?u8 {
+        const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
+        if (trimmed.len == 0) return null;
+
+        // Accept either "0"/"1" or "PIN=0"/"PIN=1" output forms.
+        var i: usize = trimmed.len;
+        while (i > 0) : (i -= 1) {
+            const ch = trimmed[i - 1];
+            if (ch == '0') return 0;
+            if (ch == '1') return 1;
+        }
+        return null;
     }
 
     /// Export a GPIO pin via sysfs. Ignores errors (pin may already be exported).
@@ -1298,6 +1409,17 @@ test "RpiGpioPeripheral.gpioStateString" {
     try std.testing.expectEqualStrings("HIGH", RpiGpioPeripheral.gpioStateString(255));
 }
 
+test "RpiGpioPeripheral.parseGpiodValue parses plain value" {
+    try std.testing.expectEqual(@as(?u8, 0), RpiGpioPeripheral.parseGpiodValue("0\n"));
+    try std.testing.expectEqual(@as(?u8, 1), RpiGpioPeripheral.parseGpiodValue("1"));
+}
+
+test "RpiGpioPeripheral.parseGpiodValue parses assignment output" {
+    try std.testing.expectEqual(@as(?u8, 0), RpiGpioPeripheral.parseGpiodValue("17=0\n"));
+    try std.testing.expectEqual(@as(?u8, 1), RpiGpioPeripheral.parseGpiodValue("17=1"));
+    try std.testing.expectEqual(@as(?u8, null), RpiGpioPeripheral.parseGpiodValue(""));
+}
+
 test "NucleoFlash vtable works" {
     var nucleo = NucleoFlash.createF401(std.testing.allocator);
     const p = nucleo.peripheral();
@@ -1365,6 +1487,9 @@ test "gpioWrite returns success" {
 test "isSerialPathAllowed accepts valid paths" {
     try std.testing.expect(isSerialPathAllowed("/dev/ttyACM0"));
     try std.testing.expect(isSerialPathAllowed("/dev/ttyUSB0"));
+    try std.testing.expect(isSerialPathAllowed("/dev/ttyAMA0"));
+    try std.testing.expect(isSerialPathAllowed("/dev/ttyS0"));
+    try std.testing.expect(isSerialPathAllowed("/dev/serial0"));
     try std.testing.expect(isSerialPathAllowed("/dev/tty.usbmodem1234"));
     try std.testing.expect(isSerialPathAllowed("/dev/cu.usbmodem5678"));
     try std.testing.expect(isSerialPathAllowed("/dev/cu.usbserial-1234"));
