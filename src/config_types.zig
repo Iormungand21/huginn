@@ -401,12 +401,33 @@ pub const AuditConfig = struct {
     sign_events: bool = false,
 };
 
+pub const SecretScopeConfig = struct {
+    /// Default scope for newly stored secrets.
+    default_scope: []const u8 = "workspace",
+    /// Whether to enforce scope checks on secret reads.
+    enforce: bool = false,
+};
+
+pub const WorkspacePolicyEntry = struct {
+    workspace_id: []const u8,
+    autonomy: ?[]const u8 = null,
+    require_approval_for_medium_risk: ?bool = null,
+    block_high_risk_commands: ?bool = null,
+    max_actions_per_hour: ?u32 = null,
+    extra_allowed_commands: []const []const u8 = &.{},
+    extra_allowed_paths: []const []const u8 = &.{},
+};
+
 pub const SecurityConfig = struct {
     sandbox: SandboxConfig = .{},
     resources: ResourceLimitsConfig = .{},
     audit: AuditConfig = .{},
     /// Discord/Telegram user ID of the bot owner. Only this user can use privileged tools.
     owner_id: []const u8 = "",
+    /// Secret scoping configuration.
+    secret_scope: SecretScopeConfig = .{},
+    /// Per-workspace approval policy overrides.
+    workspace_policies: []const WorkspacePolicyEntry = &.{},
 };
 
 // ── Delegate agent config ───────────────────────────────────────

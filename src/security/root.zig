@@ -19,6 +19,7 @@ pub const firejail = @import("firejail.zig");
 pub const bubblewrap = @import("bubblewrap.zig");
 pub const docker = @import("docker.zig");
 pub const detect = @import("detect.zig");
+pub const scope = @import("scope.zig");
 
 // Re-exports for convenience
 pub const AuditEvent = audit.AuditEvent;
@@ -66,6 +67,15 @@ pub const ValidationResult = docker.ValidationResult;
 pub const validateWorkspaceMount = docker.validateWorkspaceMount;
 
 pub const RateTracker = tracker.RateTracker;
+
+pub const SecretScope = scope.SecretScope;
+pub const ScopedSecret = scope.ScopedSecret;
+pub const WorkspaceApprovalPolicy = scope.WorkspaceApprovalPolicy;
+pub const SecretScopeConfig = scope.SecretScopeConfig;
+pub const WorkspacePolicyConfig = scope.WorkspacePolicyConfig;
+pub const findWorkspacePolicy = scope.findWorkspacePolicy;
+pub const findVisibleSecret = scope.findVisibleSecret;
+pub const isSecretVisible = scope.isSecretVisible;
 
 test {
     // Run tests from all submodules
