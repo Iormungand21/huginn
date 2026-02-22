@@ -48,6 +48,8 @@ pub const cost = @import("cost.zig");
 pub const observability = @import("observability.zig");
 pub const events = @import("events.zig");
 pub const events_store = @import("events_store.zig");
+pub const replay = @import("replay.zig");
+pub const budget_summary = @import("budget_summary.zig");
 pub const heartbeat = @import("heartbeat.zig");
 pub const runtime = @import("runtime.zig");
 
