@@ -46,6 +46,8 @@ pub const tools = @import("tools/root.zig");
 pub const identity = @import("identity.zig");
 pub const cost = @import("cost.zig");
 pub const observability = @import("observability.zig");
+pub const events = @import("events.zig");
+pub const events_store = @import("events_store.zig");
 pub const heartbeat = @import("heartbeat.zig");
 pub const runtime = @import("runtime.zig");
 
